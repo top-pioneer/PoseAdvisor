@@ -8,8 +8,6 @@ __pycache__/
 .env
 venv/
 .env/
-outputs/
-demo/output/
 *.obj
 *.npz
 *.png
