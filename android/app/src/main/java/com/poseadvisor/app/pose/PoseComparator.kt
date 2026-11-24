@@ -37,16 +37,7 @@ object PoseComparator {
         return out
     }
 
-    /** 生成用于屏幕展示的引导骨架：骨盆置于 (0.5, 0.55)，躯干高度约 0.30 */
-    fun guideForDisplay(guide: FloatArray): FloatArray {
-        val n = normalize(guide)
-        val scale = 0.30f
-        for (i in 0 until PoseModel.NUM_JOINTS) {
-            n[i * 3] = n[i * 3] * scale + 0.5f
-            n[i * 3 + 1] = n[i * 3 + 1] * scale + 0.55f
-        }
-        return n
-    }
+    /** 引导姿势展示坐标由 SkeletonOverlayView 按视图尺寸等比适配（见 fitGuideToView） */
 
     fun compare(userPose: FloatArray, guidePose: FloatArray): CompareResult {
         val u = normalize(userPose)

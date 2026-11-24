@@ -162,19 +162,25 @@ class MainActivity : AppCompatActivity() {
 
         val seeds = ranked.take(4).map { it.entry }
         // 前 3 个最契合的库姿势先行；随后穿插 AI 合成新姿势
-        seeds.take(3).forEach { guideQueue.add(QueueItem(it, null)) }
+        seeds.take(3).forEach { guideQueue.add(QueueItem(it, renderCardThumb(it.joints))) }
         if (seeds.size >= 2) addSynthesized(seeds[0], seeds[1])
         if (seeds.size >= 4) {
-            guideQueue.add(QueueItem(seeds[3], null))
+            guideQueue.add(QueueItem(seeds[3], renderCardThumb(seeds[3].joints)))
             addSynthesized(seeds[1], seeds[3])
         }
 
-        stripAdapter.submit(
-            guideQueue.filter { it.thumb == null }.map { it.entry },
-            guideQueue.filter { it.thumb != null }.map { it.entry to it.thumb!! },
-        )
+        stripAdapter.submit(guideQueue.map { PoseStripAdapter.Item(it.entry, it.thumb) })
         setCurrentGuide(0)
         Toast.makeText(this, "已按场景智能推荐姿势", Toast.LENGTH_SHORT).show()
+    }
+
+    /** 用解剖渲染器统一生成姿势卡片缩略图（库姿势与 AI 姿势风格一致） */
+    private fun renderCardThumb(joints: FloatArray): Bitmap {
+        return BodyOutlineRenderer.renderThumbnail(
+            joints, 192,
+            BodyOutlineRenderer.Palette(0xFF5B8CFF.toInt(), 0x00000000),
+            0xFF171A21.toInt(),
+        )
     }
 
     /** 用两个种子姿势合成新姿势，渲染缩略图后加入队列 */
@@ -188,11 +194,7 @@ class MainActivity : AppCompatActivity() {
             thumbnail = "",
             joints = joints,
         )
-        val thumb = BodyOutlineRenderer.renderThumbnail(
-            joints, 192,
-            BodyOutlineRenderer.Palette(0xFF5B8CFF.toInt(), 0x00000000),
-            0xFF171A21.toInt(),
-        )
+        val thumb = renderCardThumb(joints)
         guideQueue.add(QueueItem(entry, thumb))
     }
 
@@ -226,10 +228,7 @@ class MainActivity : AppCompatActivity() {
                 if (seeds.size >= 2) {
                     addSynthesized(seeds[0], seeds[1])
                     addSynthesized(seeds[1], seeds.last())
-                    stripAdapter.submit(
-                        guideQueue.filter { it.thumb == null }.map { it.entry },
-                        guideQueue.filter { it.thumb != null }.map { it.entry to it.thumb!! },
-                    )
+                    stripAdapter.submit(guideQueue.map { PoseStripAdapter.Item(it.entry, it.thumb) })
                     setCurrentGuide(next)
                 } else {
                     setCurrentGuide(0)
@@ -248,6 +247,8 @@ class MainActivity : AppCompatActivity() {
         Thread {
             try {
                 val bmp = frameBuffer.decodeLatest(maxDim = 480) ?: return@Thread
+                // 告知叠加层分析图像尺寸，保证用户骨架与预览画面严格对齐
+                overlayView.setImageSize(bmp.width, bmp.height)
                 poseHelper?.detectAsync(bmp, System.currentTimeMillis())
             } finally {
                 poseBusy = false

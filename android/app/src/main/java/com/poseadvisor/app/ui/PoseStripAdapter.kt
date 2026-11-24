@@ -26,9 +26,8 @@ class PoseStripAdapter(
     var selectedId: String? = null
         private set
 
-    fun submit(entries: List<PoseEntry>, synthesized: List<Pair<PoseEntry, Bitmap>> = emptyList()) {
-        val synItems = synthesized.map { (e, b) -> Item(e, b) }
-        items = synItems + entries.map { Item(it) }
+    fun submit(list: List<Item>) {
+        items = list
         selectedId = items.firstOrNull()?.entry?.id
         notifyDataSetChanged()
     }
