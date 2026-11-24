@@ -1,5 +1,5 @@
 PoseAdvisor 智能拍照姿势顾问 V1.0 源代码
-（共 47 页，2338 行）
+（共 58 页，2864 行）
 
 ----- 第 1 页 -----
 // ===== 文件: android/app/src/main/AndroidManifest.xml =====
@@ -42,19 +42,18 @@ package com.poseadvisor.app
 
 import android.Manifest
 import android.animation.ObjectAnimator
+import android.content.ActivityNotFoundException
 import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
 import android.provider.MediaStore
+import android.view.View
 
 ----- 第 2 页 -----
-import android.view.View
 import android.view.WindowManager
 import android.widget.ImageButton
 import android.widget.ImageView
@@ -66,21 +65,25 @@ import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
-import com.google.android.material.chip.Chip
-import com.google.android.material.chip.ChipGroup
 import com.poseadvisor.app.camera.CameraController
 import com.poseadvisor.app.camera.FrameBuffer
 import com.poseadvisor.app.pose.PoseComparator
+import com.poseadvisor.app.pose.PoseEntry
 import com.poseadvisor.app.pose.PoseLandmarkerHelper
 import com.poseadvisor.app.pose.PoseLibrary
+import com.poseadvisor.app.pose.PoseRecommender
+import com.poseadvisor.app.pose.PoseSynthesizer
 import com.poseadvisor.app.scene.SceneClassifier
+import com.poseadvisor.app.ui.BodyOutlineRenderer
 import com.poseadvisor.app.ui.PoseStripAdapter
 import com.poseadvisor.app.ui.SkeletonOverlayView
-import java.io.File
-import java.io.FileOutputStream
 
 /**
- * PoseAdvisor 主界面：实时取景 + 姿势推荐 + 匹配引导 + 零快门延迟拍照。
+ * PoseAdvisor 主界面：实时取景 + 智能姿势推荐 + 匹配引导 + 零快门延迟拍照。
+ *
+ * 智能推荐状态机：
+ * 场景识别 → 姿势亲和度排序 → 构建推荐队列（库姿势 + AI 合成新姿势）→
+ * 自动轮换引导（用户长时间未达标则换下一个；用户点卡则锁定 60s）。
  */
 class MainActivity : AppCompatActivity() {
 
@@ -91,7 +94,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var sceneChip: TextView
     private lateinit var flashView: View
     private lateinit var lastPhotoThumb: ImageView
-    private lateinit var categoryChips: ChipGroup
     private lateinit var poseStrip: RecyclerView
 
     private val frameBuffer = FrameBuffer()
@@ -100,12 +102,23 @@ class MainActivity : AppCompatActivity() {
     private lateinit var library: PoseLibrary
     private lateinit var stripAdapter: PoseStripAdapter
 
+    // ---- 智能推荐状态 ----
+    /** 推荐队列项（库姿势或 AI 合成姿势 + 卡片缩略图） */
+
+----- 第 3 页 -----
+    private data class QueueItem(val entry: PoseEntry, val thumb: Bitmap?)
+
+    private val guideQueue = mutableListOf<QueueItem>()
+    private var queueIndex = -1
+    private var currentSinceMs = 0L
+    private var bestScoreCurrent = 0
+    private var lockUntilMs = 0L               // 用户手动选卡后的锁定截止时间
+    private var synthCounter = 0
+
     private var frameCounter = 0
     private var lastPhotoUri: Uri? = null
     @Volatile private var poseBusy = false
 
-
------ 第 3 页 -----
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
@@ -117,7 +130,6 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS.let { window.addFlags(it) }
         setContentView(R.layout.activity_main)
 
         previewView = findViewById(R.id.previewView)
@@ -127,11 +139,9 @@ class MainActivity : AppCompatActivity() {
         sceneChip = findViewById(R.id.sceneChip)
         flashView = findViewById(R.id.flashView)
         lastPhotoThumb = findViewById(R.id.lastPhotoThumb)
-        categoryChips = findViewById(R.id.categoryChips)
         poseStrip = findViewById(R.id.poseStrip)
 
         library = PoseLibrary.load(this)
-        setupCategoryChips()
         setupPoseStrip()
 
         cameraController = CameraController(this, this, previewView) { image ->
@@ -146,18 +156,14 @@ class MainActivity : AppCompatActivity() {
         findViewById<ImageButton>(R.id.btnSwitchCamera).setOnClickListener {
             cameraController.switchCamera()
             overlayView.setMirror(cameraController.isFront())
+
+----- 第 4 页 -----
         }
         findViewById<ImageView>(R.id.btnShutter).setOnClickListener { captureZeroLag() }
         findViewById<ImageButton>(R.id.btnDetectScene).setOnClickListener { detectScene() }
-        lastPhotoThumb.setOnClickListener {
-            lastPhotoUri?.let { uri ->
-                startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "image/jpeg"))
-            }
-        }
+        lastPhotoThumb.setOnClickListener { openLastPhoto() }
 
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
-
------ 第 4 页 -----
             == PackageManager.PERMISSION_GRANTED
         ) {
             startCamera()
@@ -169,53 +175,124 @@ class MainActivity : AppCompatActivity() {
     private fun startCamera() {
         cameraController.start()
         overlayView.setMirror(cameraController.isFront())
-        // 启动后做一次自动场景识别，给出初始推荐类别
+        // 启动后自动场景识别 → 自动生成推荐队列
         previewView.postDelayed({ detectScene() }, 1200)
     }
 
-    // ---------- 姿势推荐 UI ----------
-
-    private fun setupCategoryChips() {
-        for (cat in library.categories) {
-            val chip = Chip(this).apply {
-                text = cat.label
-                tag = cat.id
-                isCheckable = true
-                setTextColor(ContextCompat.getColor(context, R.color.text_primary))
-                chipBackgroundColor = ContextCompat.getColorStateList(context, R.color.surface_chip)
-                setOnClickListener { selectCategory(cat.id) }
-            }
-            categoryChips.addView(chip)
-        }
-        (categoryChips.getChildAt(0) as? Chip)?.isChecked = true
-    }
+    // ---------- 智能推荐 ----------
 
     private fun setupPoseStrip() {
         stripAdapter = PoseStripAdapter { entry ->
-            overlayView.setGuidePose(entry.joints)
+            // 用户手动选卡：锁定 60 秒，暂停自动轮换
+            lockUntilMs = System.currentTimeMillis() + 60_000
+            val idx = guideQueue.indexOfFirst { it.entry.id == entry.id }
+            if (idx >= 0) setCurrentGuide(idx)
         }
         poseStrip.layoutManager = LinearLayoutManager(this, LinearLayoutManager.HORIZONTAL, false)
         poseStrip.adapter = stripAdapter
-        selectCategory(library.categories.first().id)
     }
 
-    private fun selectCategory(categoryId: String) {
-        for (i in 0 until categoryChips.childCount) {
-            (categoryChips.getChildAt(i) as? Chip)?.isChecked =
-                categoryChips.getChildAt(i).tag == categoryId
-        }
-        val list = library.posesOf(categoryId)
-        stripAdapter.submit(list)
-        overlayView.setGuidePose(stripAdapter.current()?.joints)
+    /** 场景识别 → 亲和度排序 → 构建"库姿势 + AI 合成"混合推荐队列 */
+    private fun detectScene() {
+        val frame = frameBuffer.latest ?: return
+        val hint = SceneClassifier.classify(frame)
+        sceneChip.text = hint.label
+        sceneChip.visibility = View.VISIBLE
+        buildGuideQueue(hint.profile)
     }
+
+    private fun buildGuideQueue(profile: SceneClassifier.SceneProfile) {
+        val ranked = PoseRecommender.rank(library, profile)
+        guideQueue.clear()
+        synthCounter = 0
+
+        val seeds = ranked.take(4).map { it.entry }
+        // 前 3 个最契合的库姿势先行；随后穿插 AI 合成新姿势
 
 ----- 第 5 页 -----
+        seeds.take(3).forEach { guideQueue.add(QueueItem(it, null)) }
+        if (seeds.size >= 2) addSynthesized(seeds[0], seeds[1])
+        if (seeds.size >= 4) {
+            guideQueue.add(QueueItem(seeds[3], null))
+            addSynthesized(seeds[1], seeds[3])
+        }
+
+        stripAdapter.submit(
+            guideQueue.filter { it.thumb == null }.map { it.entry },
+            guideQueue.filter { it.thumb != null }.map { it.entry to it.thumb!! },
+        )
+        setCurrentGuide(0)
+        Toast.makeText(this, "已按场景智能推荐姿势", Toast.LENGTH_SHORT).show()
+    }
+
+    /** 用两个种子姿势合成新姿势，渲染缩略图后加入队列 */
+    private fun addSynthesized(a: PoseEntry, b: PoseEntry) {
+        val joints = PoseSynthesizer.synthesize(a.joints, b.joints)
+        synthCounter++
+        val entry = PoseEntry(
+            id = "ai_synth_$synthCounter",
+            category = "ai",
+            label = "AI 新创·$synthCounter",
+            thumbnail = "",
+            joints = joints,
+        )
+        val thumb = BodyOutlineRenderer.renderThumbnail(
+            joints, 192,
+            BodyOutlineRenderer.Palette(0xFF5B8CFF.toInt(), 0x00000000),
+            0xFF171A21.toInt(),
+        )
+        guideQueue.add(QueueItem(entry, thumb))
+    }
+
+    private fun setCurrentGuide(index: Int) {
+        if (index !in guideQueue.indices) return
+        queueIndex = index
+        currentSinceMs = System.currentTimeMillis()
+        bestScoreCurrent = 0
+        val item = guideQueue[index]
+        overlayView.setGuidePose(item.entry.joints)
+        stripAdapter.selectById(item.entry.id)
+        // 卡条顺序与队列顺序不完全一致，滚动到相近位置即可
+        poseStrip.smoothScrollToPosition(index.coerceIn(0, guideQueue.size - 1))
+    }
+
+    /** 自动轮换：用户在该姿势下长时间未达标 → 换下一个候选 */
+    private fun maybeAdvanceGuide(score: Int) {
+        val now = System.currentTimeMillis()
+        if (now < lockUntilMs) return
+
+----- 第 6 页 -----
+        if (score > bestScoreCurrent) bestScoreCurrent = score
+        if (score >= 85) return // 已达标，保持当前姿势
+        val dwellMs = now - currentSinceMs
+        // 12 秒无进展，或 8 秒仍低于 40 分 → 换下一个
+        if (dwellMs > 12_000 || (dwellMs > 8_000 && bestScoreCurrent < 40)) {
+            val next = queueIndex + 1
+            if (next < guideQueue.size) {
+                setCurrentGuide(next)
+            } else {
+                // 队列用尽：以当前最优种子再合成一批新姿势
+                val seeds = guideQueue.take(3).map { it.entry }
+                if (seeds.size >= 2) {
+                    addSynthesized(seeds[0], seeds[1])
+                    addSynthesized(seeds[1], seeds.last())
+                    stripAdapter.submit(
+                        guideQueue.filter { it.thumb == null }.map { it.entry },
+                        guideQueue.filter { it.thumb != null }.map { it.entry to it.thumb!! },
+                    )
+                    setCurrentGuide(next)
+                } else {
+                    setCurrentGuide(0)
+                }
+            }
+        }
+    }
 
     // ---------- 实时姿态推理与匹配反馈 ----------
 
     private fun maybeRunPoseInference() {
         frameCounter++
-        if (frameCounter % 3 != 0) return          // 约 10fps 推理频率
+        if (frameCounter % 3 != 0) return
         if (poseBusy) return
         poseBusy = true
         Thread {
@@ -229,13 +306,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onUserPose(joints: FloatArray) {
-        val guide = stripAdapter.current()?.joints
+        val guide = guideQueue.getOrNull(queueIndex)?.entry?.joints
         if (guide == null) {
             overlayView.updateUserPose(joints, null)
             return
         }
         val result = PoseComparator.compare(joints, guide)
+
+----- 第 7 页 -----
         overlayView.updateUserPose(joints, result)
+        maybeAdvanceGuide(result.score)
 
         scoreBadge.visibility = View.VISIBLE
         scoreBadge.text = getString(R.string.score_label) + " " + result.score
@@ -252,18 +332,6 @@ class MainActivity : AppCompatActivity() {
             hintText.text = getString(R.string.hint_perfect)
             hintText.visibility = if (result.score >= 85) View.VISIBLE else View.GONE
         }
-    }
-
-    // ---------- 场景识别 ----------
-
-    private fun detectScene() {
-        val frame = frameBuffer.latest ?: return
-        val hint = SceneClassifier.classify(frame)
-        sceneChip.text = hint.label
-
------ 第 6 页 -----
-        sceneChip.visibility = View.VISIBLE
-        selectCategory(hint.suggestedCategory)
     }
 
     // ---------- 零快门延迟拍照 ----------
@@ -289,38 +357,32 @@ class MainActivity : AppCompatActivity() {
         return Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, false)
     }
 
+    /** 统一走 MediaStore 保存（API 26+ 均适用，无需文件权限） */
     private fun saveToGallery(bmp: Bitmap): Uri? {
         val name = "PoseAdvisor_${System.currentTimeMillis()}.jpg"
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val values = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, name)
-                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+        val values = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, name)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+
+----- 第 8 页 -----
                 put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/PoseAdvisor")
             }
-            val uri = contentResolver.insert(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values
-            )
-            uri?.also {
-                contentResolver.openOutputStream(it)?.use { out ->
-                    bmp.compress(Bitmap.CompressFormat.JPEG, 95, out)
-                }
-            }
-            uri
+        }
+        val collection = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         } else {
-            @Suppress("DEPRECATION")
-            val dir = File(
-                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES),
-                "PoseAdvisor"
-            )
-
------ 第 7 页 -----
-            dir.mkdirs()
-            val file = File(dir, name)
-            FileOutputStream(file).use { out ->
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+        }
+        val uri = contentResolver.insert(collection, values) ?: return null
+        return try {
+            contentResolver.openOutputStream(uri)?.use { out ->
                 bmp.compress(Bitmap.CompressFormat.JPEG, 95, out)
-            }
-            MediaScannerConnection.scanFile(this, arrayOf(file.absolutePath), null, null)
-            Uri.fromFile(file)
+            } ?: return null
+            uri
+        } catch (e: Exception) {
+            contentResolver.delete(uri, null, null)
+            null
         }
     }
 
@@ -335,11 +397,27 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, "${getString(R.string.capture_saved)}（${elapsedMs}ms）", Toast.LENGTH_SHORT).show()
     }
 
+    /** 预览最近照片：授予临时读取权限，兼容无图库应用的情况 */
+    private fun openLastPhoto() {
+        val uri = lastPhotoUri ?: return
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "image/jpeg")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        try {
+            startActivity(intent)
+        } catch (e: ActivityNotFoundException) {
+            Toast.makeText(this, "未找到可查看图片的应用", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     private fun flashAnimation() {
         ObjectAnimator.ofFloat(flashView, View.ALPHA, 0f, 0.85f, 0f).apply {
             duration = 260
             start()
         }
+
+----- 第 9 页 -----
     }
 
     override fun onDestroy() {
@@ -364,8 +442,6 @@ import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import java.util.concurrent.ExecutorService
-
------ 第 8 页 -----
 import java.util.concurrent.Executors
 
 /**
@@ -392,6 +468,8 @@ class CameraController(
         }, ContextCompat.getMainExecutor(context))
     }
 
+
+----- 第 10 页 -----
     fun switchCamera() {
         lensFacing = if (lensFacing == CameraSelector.LENS_FACING_BACK) {
             CameraSelector.LENS_FACING_FRONT
@@ -416,8 +494,6 @@ class CameraController(
                     android.util.Size(1280, 720),
                     ResolutionStrategy.FALLBACK_RULE_CLOSEST_HIGHER_THEN_LOWER
                 )
-
------ 第 9 页 -----
             )
             .build()
 
@@ -444,6 +520,8 @@ class CameraController(
         cameraProvider?.unbindAll()
         analysisExecutor.shutdown()
     }
+
+----- 第 11 页 -----
 }
 
 // ===== 文件: android/app/src/main/java/com/poseadvisor/app/camera/FrameBuffer.kt =====
@@ -468,8 +546,6 @@ class FrameBuffer {
     data class Frame(
         val nv21: ByteArray,
         val width: Int,
-
------ 第 10 页 -----
         val height: Int,
         val rotationDegrees: Int,
         val timestampMs: Long,
@@ -496,6 +572,8 @@ class FrameBuffer {
         yuv.compressToJpeg(Rect(0, 0, f.width, f.height), 92, out)
         var bmp = BitmapFactory.decodeByteArray(out.toByteArray(), 0, out.size()) ?: return null
         if (f.rotationDegrees != 0) {
+
+----- 第 12 页 -----
             val m = Matrix().apply { postRotate(f.rotationDegrees.toFloat()) }
             bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
         }
@@ -520,8 +598,6 @@ class FrameBuffer {
             var offset = 0
             val yBuffer = yPlane.buffer
             val yRowStride = yPlane.rowStride
-
------ 第 11 页 -----
             if (yRowStride == w) {
                 yBuffer.get(out, 0, w * h)
                 offset = w * h
@@ -548,6 +624,8 @@ class FrameBuffer {
             for (r in 0 until chromaH) {
                 for (c in 0 until chromaW) {
                     out[offset++] = vBuffer.get(r * vRowStride + c * vPixelStride)
+
+----- 第 13 页 -----
                     out[offset++] = uBuffer.get(r * uRowStride + c * uPixelStride)
                 }
             }
@@ -572,8 +650,6 @@ object PoseModel {
     const val SPINE_LOWER = 1
     const val SPINE_MID = 2
     const val CHEST = 3
-
------ 第 12 页 -----
     const val NECK = 4
     const val HEAD = 5
     const val ANKLE_L = 7
@@ -601,6 +677,8 @@ object PoseModel {
         5 to 22,
     )
 
+----- 第 14 页 -----
+
     /** 用于姿势比对的关键肢体段（索引对 + 中文部位名 + 权重） */
     data class LimbSegment(val a: Int, val b: Int, val partName: String, val weight: Float)
 
@@ -624,8 +702,6 @@ fun FloatArray.jy(idx: Int) = this[idx * 3 + 1]
 package com.poseadvisor.app.pose
 
 import android.content.Context
-
------ 第 13 页 -----
 import android.graphics.Bitmap
 import android.util.Log
 import com.google.mediapipe.framework.image.BitmapImageBuilder
@@ -652,6 +728,8 @@ class PoseLandmarkerHelper(
         } catch (e: Exception) {
             Log.w(TAG, "GPU 委托不可用，回退 CPU", e)
             try {
+
+----- 第 15 页 -----
                 baseBuilder.setDelegate(Delegate.CPU)
                 landmarker = create(context, baseBuilder.build())
             } catch (e2: Exception) {
@@ -676,8 +754,6 @@ class PoseLandmarkerHelper(
         return PoseLandmarker.createFromOptions(context, options)
     }
 
-
------ 第 14 页 -----
     fun detectAsync(bitmap: Bitmap, timestampMs: Long) {
         val lm = landmarker ?: return
         try {
@@ -704,6 +780,8 @@ package com.poseadvisor.app.pose
 
 import com.google.mediapipe.tasks.vision.poselandmarker.PoseLandmarkerResult
 
+
+----- 第 16 页 -----
 /**
  * 将 MediaPipe 33 个姿态关键点转换为与训练管线一致的 25 关节 75 维向量，
  * 逻辑与 PC 端 mediapipe_to_pose_vector.py 完全对齐。
@@ -728,8 +806,6 @@ object PoseMapper {
         put(0, 22)   // 鼻子
         put(2, 23)   // 左眼
         put(5, 24)   // 右眼
-
------ 第 15 页 -----
         put(11, 10)  // 左肩
         put(12, 11)  // 右肩
         put(25, 12)  // 左髋
@@ -756,6 +832,8 @@ object PoseMapper {
             j[dst * 3 + 2] = z / src.size
         }
 
+
+----- 第 17 页 -----
         avg(PoseModel.PELVIS, 12, 15)                    // 骨盆中心
         avg(2, 10, 11, 12, 15)                           // 脊柱中
         avg(3, 10, 11)                                   // 脊柱上（胸口）
@@ -780,8 +858,6 @@ object PoseMapper {
 
 package com.poseadvisor.app.pose
 
-
------ 第 16 页 -----
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.exp
@@ -808,6 +884,8 @@ object PoseComparator {
         val out = pose.copyOf()
         val px = pose.jx(PoseModel.PELVIS)
         val py = pose.jy(PoseModel.PELVIS)
+
+----- 第 18 页 -----
         val torso = sqrt(
             (pose.jx(PoseModel.NECK) - px) * (pose.jx(PoseModel.NECK) - px) +
                 (pose.jy(PoseModel.NECK) - py) * (pose.jy(PoseModel.NECK) - py)
@@ -832,8 +910,6 @@ object PoseComparator {
 
     fun compare(userPose: FloatArray, guidePose: FloatArray): CompareResult {
         val u = normalize(userPose)
-
------ 第 17 页 -----
         val g = normalize(guidePose)
 
         val segs = PoseModel.COMPARE_SEGMENTS
@@ -860,6 +936,8 @@ object PoseComparator {
 
         val hint = if (worstIdx >= 0 && worstErr > OK_THRESHOLD_RAD) {
             val s = segs[worstIdx]
+
+----- 第 19 页 -----
             // 用远端关节的相对位移给出方向提示
             val dx = g.jx(s.b) - u.jx(s.b)
             val dy = g.jy(s.b) - u.jy(s.b)
@@ -884,8 +962,6 @@ import org.json.JSONObject
 
 /** 姿势库中的一条姿势记录 */
 data class PoseEntry(
-
------ 第 18 页 -----
     val id: String,
     val category: String,
     val label: String,
@@ -912,6 +988,8 @@ class PoseLibrary private constructor(
             for (i in 0 until cats.length()) {
                 val c = cats.getJSONObject(i)
                 categories.add(PoseCategory(c.getString("id"), c.getString("label")))
+
+----- 第 20 页 -----
             }
 
             val poses = mutableListOf<PoseEntry>()
@@ -936,10 +1014,262 @@ class PoseLibrary private constructor(
                     )
                 )
             }
-
------ 第 19 页 -----
             return PoseLibrary(categories, poses)
         }
+    }
+}
+
+// ===== 文件: android/app/src/main/java/com/poseadvisor/app/pose/PoseFeatures.kt =====
+
+package com.poseadvisor.app.pose
+
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.sqrt
+
+/**
+ * 姿势几何特征向量：用于"场景 × 姿势"智能匹配。
+ * 全部在归一化空间（骨盆原点、躯干单位长）计算，与位置/身高无关。
+ */
+object PoseFeatures {
+
+    data class Features(
+        val armRaise: Float,      // 抬手高度（肩到最高手腕的垂直距离，越高越张扬）
+        val spread: Float,        // 双臂展开度（腕距/肩距）
+        val legSpread: Float,     // 双腿展开度（踝距/肩距）
+        val torsoTilt: Float,     // 躯干倾斜角（弧度，0=直立，越大越动感/随性）
+        val compactness: Float,   // 肢体收敛度（各关节到骨盆的平均距离，越小越收敛）
+    )
+
+----- 第 21 页 -----
+
+    fun of(pose75: FloatArray): Features {
+        val p = PoseComparator.normalize(pose75)
+        val shoulderY = (p.jy(PoseModel.SHOULDER_L) + p.jy(PoseModel.SHOULDER_R)) / 2
+        val wristMinY = minOf(p.jy(PoseModel.WRIST_L), p.jy(PoseModel.WRIST_R))
+        val shoulderSpan = abs(p.jx(PoseModel.SHOULDER_L) - p.jx(PoseModel.SHOULDER_R)) + 1e-6f
+
+        val spread = abs(p.jx(PoseModel.WRIST_L) - p.jx(PoseModel.WRIST_R)) / shoulderSpan
+        val legSpread = abs(p.jx(PoseModel.ANKLE_L) - p.jx(PoseModel.ANKLE_R)) / shoulderSpan
+
+        // 躯干与竖直方向的夹角
+        val dx = p.jx(PoseModel.NECK) - p.jx(PoseModel.PELVIS)
+        val dy = p.jy(PoseModel.NECK) - p.jy(PoseModel.PELVIS)
+        val tilt = abs(atan2(dx, -dy))
+
+        var acc = 0f
+        var cnt = 0
+        for (i in intArrayOf(5, 16, 17, 7, 8, 13, 14)) {
+            val d = sqrt(p.jx(i) * p.jx(i) + p.jy(i) * p.jy(i))
+            acc += d; cnt++
+        }
+
+        return Features(
+            armRaise = shoulderY - wristMinY,
+            spread = spread,
+            legSpread = legSpread,
+            torsoTilt = tilt,
+            compactness = acc / cnt,
+        )
+    }
+}
+
+// ===== 文件: android/app/src/main/java/com/poseadvisor/app/pose/PoseRecommender.kt =====
+
+package com.poseadvisor.app.pose
+
+import com.poseadvisor.app.scene.SceneClassifier
+
+/**
+ * 智能姿势推荐引擎：
+ * 将场景多维特征与每个姿势的几何特征做亲和度打分，自动排序出
+ * 与当前环境气质最契合的姿势候选队列，无需人工挑选。
+ *
+ * 匹配直觉：
+ *  - 天空/开阔 → 双臂展开、腿部分开的舒展姿势
+ *  - 绿地/自然 → 站立舒展、躯干略有动势的姿势
+ *  - 弱光/室内 → 收敛、低重心姿势
+ *  - 暖色氛围 → 适度抬手的柔和姿势
+ */
+object PoseRecommender {
+
+----- 第 22 页 -----
+
+    data class Ranked(
+        val entry: PoseEntry,
+        val features: PoseFeatures.Features,
+        val affinity: Float,
+    )
+
+    fun rank(library: PoseLibrary, scene: SceneClassifier.SceneProfile): List<Ranked> {
+        return library.poses.map { entry ->
+            val f = PoseFeatures.of(entry.joints)
+            Ranked(entry, f, affinity(f, scene))
+        }.sortedByDescending { it.affinity }
+    }
+
+    private fun affinity(f: PoseFeatures.Features, s: SceneClassifier.SceneProfile): Float {
+        var score = 0f
+        // 开阔天空 ↔ 展开度
+        score += s.skyRatio * (0.9f * f.spread + 0.6f * f.legSpread)
+        // 自然绿意 ↔ 站立动势（腿部分开 + 适度躯干倾斜）
+        score += s.greenRatio * (0.7f * f.legSpread + 0.8f * f.torsoTilt)
+        // 弱光 ↔ 收敛低重心（收敛度越小越好）
+        score += (1f - s.brightness).coerceIn(0f, 1f) * (1.2f - f.compactness).coerceIn(-0.5f, 1.2f)
+        // 暖色氛围 ↔ 适度抬手（过度张扬反而减分）
+        score += s.warmRatio * (if (f.armRaise in 0.15f..0.9f) 0.6f else 0.15f)
+        // 画面活力 ↔ 整体展开
+        score += s.colorfulness * 0.4f * f.spread
+        // 弱光环境惩罚大倾斜（不稳）
+        if (s.brightness < 0.33f) score -= 0.5f * f.torsoTilt
+        return score
+    }
+}
+
+// ===== 文件: android/app/src/main/java/com/poseadvisor/app/pose/PoseSynthesizer.kt =====
+
+package com.poseadvisor.app.pose
+
+import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.min
+import kotlin.math.sin
+import kotlin.math.sqrt
+import kotlin.random.Random
+
+/**
+ * 端上姿势合成器：在库中最契合的两个姿势之间插值，并施加小扰动，
+ * 再经"自然性投影"（肢体长度锁定 + 关节角度生物力学限幅），
+ * 创造出姿势库中不存在、但解剖学上自然可信的新姿势。
+ *
+ * 自然性优先：任何不满足约束的结果自动回退为纯插值姿势。
+ */
+
+----- 第 23 页 -----
+object PoseSynthesizer {
+
+    /** 肢体段（两端关节索引 + 中文名）——长度需要锁定 */
+    private val BONES = listOf(
+        PoseModel.PELVIS to PoseModel.NECK,          // 躯干
+        PoseModel.NECK to PoseModel.HEAD,            // 颈头
+        PoseModel.SHOULDER_L to PoseModel.ELBOW_L,   // 左上臂
+        PoseModel.ELBOW_L to PoseModel.WRIST_L,      // 左前臂
+        PoseModel.SHOULDER_R to PoseModel.ELBOW_R,   // 右上臂
+        PoseModel.ELBOW_R to PoseModel.WRIST_R,      // 右前臂
+        PoseModel.HIP_L to PoseModel.ANKLE_L,        // 左腿
+        PoseModel.HIP_R to PoseModel.ANKLE_R,        // 右腿
+        PoseModel.SHOULDER_L to PoseModel.SHOULDER_R, // 肩宽
+        PoseModel.HIP_L to PoseModel.HIP_R,           // 髋宽
+    )
+
+    /** 关节角度限幅（弧度）：[顶点, 近端, 远端, 最小角, 最大角] */
+    private data class AngleLimit(val apex: Int, val from: Int, val to: Int, val minDeg: Float, val maxDeg: Float)
+
+    private val ANGLE_LIMITS = listOf(
+        AngleLimit(PoseModel.ELBOW_L, PoseModel.SHOULDER_L, PoseModel.WRIST_L, 12f, 178f),
+        AngleLimit(PoseModel.ELBOW_R, PoseModel.SHOULDER_R, PoseModel.WRIST_R, 12f, 178f),
+        AngleLimit(PoseModel.SHOULDER_L, PoseModel.NECK, PoseModel.ELBOW_L, 8f, 170f),
+        AngleLimit(PoseModel.SHOULDER_R, PoseModel.NECK, PoseModel.ELBOW_R, 8f, 170f),
+        AngleLimit(PoseModel.HIP_L, PoseModel.PELVIS, PoseModel.ANKLE_L, 5f, 172f),
+        AngleLimit(PoseModel.HIP_R, PoseModel.PELVIS, PoseModel.ANKLE_R, 5f, 172f),
+    )
+
+    /**
+     * 合成一个新姿势。
+     * @param a, b 两个种子姿势（75维，归一化或原始均可，内部统一归一化）
+     * @param lambda 插值系数（0~1，默认随机 0.3~0.7）
+     * @param noise 扰动强度（躯干单位，默认 0.05）
+     */
+    fun synthesize(
+        a: FloatArray,
+        b: FloatArray,
+        lambda: Float = 0.3f + Random.nextFloat() * 0.4f,
+        noise: Float = 0.05f,
+    ): FloatArray {
+        val na = PoseComparator.normalize(a)
+        val nb = PoseComparator.normalize(b)
+
+        // 1. 插值
+        val interp = FloatArray(PoseModel.POSE_DIM) { i -> na[i] * lambda + nb[i] * (1f - lambda) }
+
+        // 2. 小扰动（只动四肢末端与肘/腕/踝，躯干与头保持稳定 = 自然感来源之一）
+        val perturbed = interp.copyOf()
+        val movable = intArrayOf(13, 14, 16, 17, 18, 19, 7, 8)
+        for (jt in movable) {
+
+----- 第 24 页 -----
+            perturbed[jt * 3] += (Random.nextFloat() - 0.5f) * 2f * noise
+            perturbed[jt * 3 + 1] += (Random.nextFloat() - 0.5f) * 2f * noise
+        }
+
+        // 3. 自然性投影：锁定肢体长度 + 关节角度限幅（迭代 2 轮收敛）
+        val natural = perturbed.copyOf()
+        repeat(2) {
+            projectBoneLengths(natural, reference = interp)
+            projectAngleLimits(natural)
+        }
+
+        // 4. 验收：段长误差与角度均达标才返回合成结果，否则回退纯插值
+        return if (isNatural(natural, interp)) natural else interp
+    }
+
+    /** 将每段骨骼的远端点沿当前方向重定位到参考段长 */
+    private fun projectBoneLengths(pose: FloatArray, reference: FloatArray) {
+        for ((ai, bi) in BONES) {
+            val ax = pose.jx(ai); val ay = pose.jy(ai)
+            var dx = pose.jx(bi) - ax; var dy = pose.jy(bi) - ay
+            val len = sqrt(dx * dx + dy * dy)
+            if (len < 1e-6f) continue
+            val refLen = sqrt(
+                (reference.jx(bi) - reference.jx(ai)).let { it * it } +
+                    (reference.jy(bi) - reference.jy(ai)).let { it * it }
+            )
+            dx /= len; dy /= len
+            pose[bi * 3] = ax + dx * refLen
+            pose[bi * 3 + 1] = ay + dy * refLen
+        }
+    }
+
+    /** 关节角度限幅：超过范围时把远端点旋转回边界角度 */
+    private fun projectAngleLimits(pose: FloatArray) {
+        for (lim in ANGLE_LIMITS) {
+            val apexX = pose.jx(lim.apex); val apexY = pose.jy(lim.apex)
+            val a1 = atan2(pose.jy(lim.from) - apexY, pose.jx(lim.from) - apexX)
+            val a2 = atan2(pose.jy(lim.to) - apexY, pose.jx(lim.to) - apexX)
+            var deg = Math.toDegrees((a2 - a1).toDouble()).toFloat()
+            while (deg > 180f) deg -= 360f
+            while (deg < -180f) deg += 360f
+            val absDeg = kotlin.math.abs(deg)
+            val clamped = absDeg.coerceIn(lim.minDeg, lim.maxDeg)
+            if (clamped == absDeg) continue
+            // 远端点重定位：保持与 apex 距离，角度贴到边界
+            val sign = if (deg >= 0) 1f else -1f
+            val newA2 = a1 + Math.toRadians((clamped * sign).toDouble()).toFloat()
+            val rx = pose.jx(lim.to) - apexX
+            val ry = pose.jy(lim.to) - apexY
+            val r = sqrt(rx * rx + ry * ry)
+
+----- 第 25 页 -----
+            pose[lim.to * 3] = apexX + cos(newA2) * r
+            pose[lim.to * 3 + 1] = apexY + sin(newA2) * r
+        }
+    }
+
+    /** 自然性验收：骨骼长度误差 ≤8%，且头在骨盆上方、人体不翻转 */
+    private fun isNatural(pose: FloatArray, reference: FloatArray): Boolean {
+        for ((ai, bi) in BONES) {
+            val len = dist(pose, ai, bi)
+            val refLen = dist(reference, ai, bi)
+            if (refLen > 1e-4f && kotlin.math.abs(len - refLen) / refLen > 0.08f) return false
+        }
+        // 头必须在骨盆上方（y 向下）
+        if (pose.jy(PoseModel.HEAD) > pose.jy(PoseModel.PELVIS)) return false
+        return true
+    }
+
+    private fun dist(p: FloatArray, a: Int, b: Int): Float {
+        val dx = p.jx(b) - p.jx(a); val dy = p.jy(b) - p.jy(a)
+        return sqrt(dx * dx + dy * dy)
     }
 }
 
@@ -948,65 +1278,272 @@ class PoseLibrary private constructor(
 package com.poseadvisor.app.scene
 
 import com.poseadvisor.app.camera.FrameBuffer
+import kotlin.math.abs
 
 /**
- * 轻量场景识别：对最新预览帧做亚采样统计（亮度/绿色占比/天空占比），
- * 毫秒级完成，为姿势推荐选择默认类别。用户可随时手动切换类别。
+ * 轻量场景理解：对最新预览帧亚采样统计，输出多维场景特征向量，
+ * 毫秒级完成。既给出人类可读的场景标签，也为姿势推荐引擎提供
+ * 连续的特征输入（亮度/绿意/天空/暖色/画面活力）。
  */
 object SceneClassifier {
 
-    data class SceneHint(val label: String, val suggestedCategory: String)
+    /** 多维场景特征（0~1 归一） */
+    data class SceneProfile(
+        val brightness: Float,    // 亮度
+        val greenRatio: Float,    // 植被占比
+        val skyRatio: Float,      // 天空占比（画面上部蓝色）
+        val warmRatio: Float,     // 暖色占比（夕阳/暖光氛围）
+        val colorfulness: Float,  // 画面活力（色彩丰富度）
+    )
+
+    data class SceneHint(val label: String, val profile: SceneProfile)
 
     fun classify(frame: FrameBuffer.Frame): SceneHint {
         val data = frame.nv21
+
+----- 第 26 页 -----
         val w = frame.width
         val h = frame.height
 
         var brightSum = 0L
+        var satSum = 0L
         var greenCount = 0
         var skyCount = 0
+        var warmCount = 0
         var total = 0
         var topTotal = 0
 
-        // 亚采样 Y 平面（每 8 行每 8 列取一个点）
         var r = 0
         while (r < h) {
             var c = 0
             while (c < w) {
                 val y = data[r * w + c].toInt() and 0xFF
                 brightSum += y
-                // 用 UV 粗判绿色/蓝色（NV21：VU 交错）
                 val uvIndex = w * h + (r / 2) * w + (c / 2) * 2
                 if (uvIndex + 1 < data.size) {
-                    val v = data[uvIndex].toInt() and 0xFF
-                    val u = data[uvIndex + 1].toInt() and 0xFF
-                    // 绿色：U、V 均偏低；天空蓝：U 高 V 中低
+                    val v = data[uvIndex].toInt() and 0xFF      // V：红-青轴
+                    val u = data[uvIndex + 1].toInt() and 0xFF  // U：蓝-黄轴
+                    val saturation = abs(u - 128) + abs(v - 128)
+                    satSum += saturation
+
                     if (u < 100 && v < 110 && y in 40..220) greenCount++
+                    if (v > 145 && u < 135 && y > 60) warmCount++           // 偏红暖调
                     if (r < h / 3) {
                         topTotal++
                         if (u > 130 && v < 130 && y > 80) skyCount++
                     }
                 }
                 total++
-
------ 第 20 页 -----
                 c += 8
             }
             r += 8
         }
 
-        if (total == 0) return SceneHint("日常街拍", "standing")
-        val brightness = brightSum.toFloat() / total / 255f
-        val greenRatio = greenCount.toFloat() / total
-        val skyRatio = if (topTotal > 0) skyCount.toFloat() / topTotal else 0f
-
-        return when {
-            greenRatio > 0.25f -> SceneHint("户外自然", "standing")
-            skyRatio > 0.30f -> SceneHint("开阔天空", "dynamic")
-            brightness < 0.33f -> SceneHint("室内弱光", "sitting")
-            brightness > 0.72f -> SceneHint("明亮通透", "gesture")
-            else -> SceneHint("日常街拍", "standing")
+        if (total == 0) {
+            return SceneHint("日常街拍", SceneProfile(0.5f, 0f, 0f, 0f, 0.3f))
         }
+        val profile = SceneProfile(
+            brightness = brightSum.toFloat() / total / 255f,
+            greenRatio = greenCount.toFloat() / total,
+            skyRatio = if (topTotal > 0) skyCount.toFloat() / topTotal else 0f,
+            warmRatio = warmCount.toFloat() / total,
+            colorfulness = (satSum.toFloat() / total / 128f).coerceIn(0f, 1f),
+        )
+
+        val label = when {
+            profile.greenRatio > 0.25f -> "户外自然"
+
+----- 第 27 页 -----
+            profile.skyRatio > 0.30f -> "开阔天空"
+            profile.warmRatio > 0.30f -> "暖调氛围"
+            profile.brightness < 0.33f -> "室内弱光"
+            profile.brightness > 0.72f -> "明亮通透"
+            else -> "日常街拍"
+        }
+        return SceneHint(label, profile)
+    }
+}
+
+// ===== 文件: android/app/src/main/java/com/poseadvisor/app/ui/BodyOutlineRenderer.kt =====
+
+package com.poseadvisor.app.ui
+
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
+import com.poseadvisor.app.pose.PoseModel
+import com.poseadvisor.app.pose.jx
+import com.poseadvisor.app.pose.jy
+
+/**
+ * 丰满人形轮廓渲染器：
+ * 把 25 关节骨架"长肉"成实心剪影——头部圆、躯干圆角梯形、四肢胶囊体，
+ * 让引导姿势像真实人形轮廓而非抽象骨架，更易于对照摆姿。
+ */
+object BodyOutlineRenderer {
+
+    data class Palette(
+        val fillColor: Int,
+        val strokeColor: Int,
+    )
+
+    /**
+     * 将姿势绘制为丰满人形轮廓。
+     * @param pose 屏幕像素坐标的 75 维向量（调用方负责坐标变换）
+     * @param torsoRef 参考躯干长度（像素），决定肢体粗细
+     * @param perBoneColors 可选：按骨骼索引（BONES 顺序）给四肢单独着色（用户实时反馈用）
+     */
+    fun draw(
+        canvas: Canvas,
+        pose: FloatArray,
+        torsoRef: Float,
+        palette: Palette,
+        perBoneColors: IntArray? = null,
+    ) {
+        val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = palette.fillColor
+
+----- 第 28 页 -----
+            style = Paint.Style.FILL
+        }
+        val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = palette.strokeColor
+            style = Paint.Style.STROKE
+            strokeWidth = torsoRef * 0.05f + 1f
+        }
+
+        // ---- 四肢胶囊体（粗线 + 圆头） ----
+        val limbs = listOf(
+            Triple(PoseModel.SHOULDER_L, PoseModel.ELBOW_L, 0.30f),
+            Triple(PoseModel.ELBOW_L, PoseModel.WRIST_L, 0.26f),
+            Triple(PoseModel.SHOULDER_R, PoseModel.ELBOW_R, 0.30f),
+            Triple(PoseModel.ELBOW_R, PoseModel.WRIST_R, 0.26f),
+            Triple(PoseModel.HIP_L, PoseModel.ANKLE_L, 0.36f),
+            Triple(PoseModel.HIP_R, PoseModel.ANKLE_R, 0.36f),
+        )
+        limbs.forEachIndexed { idx, (a, b, thick) ->
+            val paint = if (perBoneColors != null && idx < perBoneColors.size) {
+                Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = perBoneColors[idx]
+                    style = Paint.Style.FILL
+                }
+            } else fillPaint
+            drawCapsule(canvas, pose, a, b, torsoRef * thick, paint, strokePaint, perBoneColors == null)
+        }
+
+        // ---- 躯干：肩线 + 髋线构成的圆角梯形 ----
+        drawTorso(canvas, pose, torsoRef, fillPaint, strokePaint, perBoneColors == null)
+
+        // ---- 头部圆 ----
+        val headR = torsoRef * 0.46f
+        canvas.drawCircle(pose.jx(PoseModel.HEAD), pose.jy(PoseModel.HEAD), headR, fillPaint)
+        if (perBoneColors == null) {
+            canvas.drawCircle(pose.jx(PoseModel.HEAD), pose.jy(PoseModel.HEAD), headR, strokePaint)
+        }
+    }
+
+    /** 胶囊体：两关节点之间的粗圆头线段 */
+    private fun drawCapsule(
+        canvas: Canvas, pose: FloatArray, a: Int, b: Int, width: Float,
+        fill: Paint, stroke: Paint, withStroke: Boolean,
+    ) {
+        val p = Paint(fill).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = width
+            strokeCap = Paint.Cap.ROUND
+        }
+        canvas.drawLine(pose.jx(a), pose.jy(a), pose.jx(b), pose.jy(b), p)
+        if (withStroke) {
+
+----- 第 29 页 -----
+            // 描边：比填充略粗的先画一层
+            val sp = Paint(stroke).apply {
+                style = Paint.Style.STROKE
+                strokeCap = Paint.Cap.ROUND
+            }
+            // 先描边（粗）再填充（细）才能看到边——重画顺序
+            sp.strokeWidth = width * 1.18f
+            p.strokeWidth = width
+            canvas.drawLine(pose.jx(a), pose.jy(a), pose.jx(b), pose.jy(b), sp)
+            canvas.drawLine(pose.jx(a), pose.jy(a), pose.jx(b), pose.jy(b), p)
+        }
+    }
+
+    /** 躯干圆角梯形：肩线两端外扩、髋线两端外扩后连接 */
+    private fun drawTorso(
+        canvas: Canvas, pose: FloatArray, torsoRef: Float,
+        fill: Paint, stroke: Paint, withStroke: Boolean,
+    ) {
+        val sl = PoseModel.SHOULDER_L; val sr = PoseModel.SHOULDER_R
+        val hl = PoseModel.HIP_L; val hr = PoseModel.HIP_R
+        val expand = 0.22f * torsoRef
+
+        fun out(a: Int, b: Int, t: Float): FloatArray {
+            val dx = pose.jx(b) - pose.jx(a); val dy = pose.jy(b) - pose.jy(a)
+            return floatArrayOf(pose.jx(a) - dx * t, pose.jy(a) - dy * t, pose.jx(b) + dx * t, pose.jy(b) + dy * t)
+        }
+
+        val shoulder = out(sl, sr, expand / (distOf(pose, sl, sr) + 1e-4f))
+        val hip = out(hl, hr, expand / (distOf(pose, hl, hr) + 1e-4f))
+
+        val path = Path().apply {
+            moveTo(shoulder[0], shoulder[1])
+            lineTo(shoulder[2], shoulder[3])
+            lineTo(hip[2], hip[3])
+            lineTo(hip[0], hip[1])
+            close()
+        }
+        canvas.drawPath(path, fill)
+        if (withStroke) canvas.drawPath(path, stroke)
+
+        // 颈：头与躯干之间的连接柱
+        val neckPaint = Paint(fill).apply {
+            style = Paint.Style.STROKE
+            strokeWidth = torsoRef * 0.24f
+            strokeCap = Paint.Cap.ROUND
+        }
+        canvas.drawLine(
+            pose.jx(PoseModel.NECK), pose.jy(PoseModel.NECK),
+            pose.jx(PoseModel.CHEST), pose.jy(PoseModel.CHEST), neckPaint
+        )
+
+----- 第 30 页 -----
+    }
+
+    private fun distOf(p: FloatArray, a: Int, b: Int): Float {
+        val dx = p.jx(b) - p.jx(a); val dy = p.jy(b) - p.jy(a)
+        return kotlin.math.sqrt(dx * dx + dy * dy)
+    }
+
+    /** 渲染姿势缩略图（供 AI 合成姿势的卡片显示） */
+    fun renderThumbnail(pose75: FloatArray, sizePx: Int, palette: Palette, background: Int): Bitmap {
+        val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        canvas.drawColor(background)
+
+        // 归一化坐标 → 缩略图坐标：以主体关节为中心自适应取景
+        val keyIdx = intArrayOf(0, 3, 4, 5, 10, 11, 13, 14, 16, 17, 12, 15, 7, 8)
+        var minX = Float.MAX_VALUE; var maxX = -Float.MAX_VALUE
+        var minY = Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
+        for (i in keyIdx) {
+            minX = minOf(minX, pose75.jx(i)); maxX = maxOf(maxX, pose75.jx(i))
+            minY = minOf(minY, pose75.jy(i)); maxY = maxOf(maxY, pose75.jy(i))
+        }
+        val cx = (minX + maxX) / 2; val cy = (minY + maxY) / 2
+        val span = maxOf(maxX - minX, maxY - minY) * 1.25f + 1e-4f
+        val scale = sizePx / span
+
+        val px = FloatArray(PoseModel.POSE_DIM)
+        for (i in 0 until PoseModel.NUM_JOINTS) {
+            px[i * 3] = (pose75.jx(i) - cx) * scale + sizePx / 2f
+            px[i * 3 + 1] = (pose75.jy(i) - cy) * scale + sizePx / 2f
+            px[i * 3 + 2] = pose75[i * 3 + 2]
+        }
+        val torso = distOf(px, PoseModel.PELVIS, PoseModel.NECK)
+        draw(canvas, px, torso, palette)
+        return bmp
     }
 }
 
@@ -1016,7 +1553,6 @@ package com.poseadvisor.app.ui
 
 import android.content.Context
 import android.graphics.Canvas
-import android.graphics.Paint
 import android.util.AttributeSet
 import android.view.View
 import androidx.core.content.ContextCompat
@@ -1024,12 +1560,14 @@ import com.poseadvisor.app.R
 import com.poseadvisor.app.pose.PoseComparator
 import com.poseadvisor.app.pose.PoseModel
 import com.poseadvisor.app.pose.jx
+
+----- 第 31 页 -----
 import com.poseadvisor.app.pose.jy
 
 /**
- * 姿势叠加渲染层：
- *  - 半透明品牌蓝"幽灵骨架"：用户要达成的推荐姿势
- *  - 用户实时骨架：达标肢体青色、偏差肢体橙色，逐段即时反馈
+ * 姿势叠加渲染层（丰满人形轮廓版）：
+ *  - 引导姿势：半透明品牌蓝实心人形剪影，所见即目标
+ *  - 用户姿势：实心轮廓，达标肢体青色、偏差肢体橙色，逐段即时反馈
  */
 class SkeletonOverlayView @JvmOverloads constructor(
     context: Context,
@@ -1038,40 +1576,14 @@ class SkeletonOverlayView @JvmOverloads constructor(
 
     private var guidePose: FloatArray? = null      // 已转为屏幕归一化坐标
     private var userPose: FloatArray? = null       // MediaPipe 原始归一化坐标
-    private var segmentOk: BooleanArray? = null
+    private var segmentOk: BooleanArray? = null    // 7 段：躯干/双臂/双腿
     private var mirror: Boolean = false
 
------ 第 21 页 -----
+    private val guidePalette = BodyOutlineRenderer.Palette(
+        fillColor = 0x555B8CFF,
+        strokeColor = 0xCC5B8CFF.toInt(),
+    )
 
-    private val guideLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ContextCompat.getColor(context, R.color.pose_guide)
-        strokeWidth = 9f
-        strokeCap = Paint.Cap.ROUND
-        style = Paint.Style.STROKE
-    }
-    private val guideJointPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ContextCompat.getColor(context, R.color.brand_primary)
-        style = Paint.Style.FILL
-        alpha = 160
-    }
-    private val matchPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ContextCompat.getColor(context, R.color.pose_match)
-        strokeWidth = 8f
-        strokeCap = Paint.Cap.ROUND
-        style = Paint.Style.STROKE
-    }
-    private val mismatchPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ContextCompat.getColor(context, R.color.pose_mismatch)
-        strokeWidth = 8f
-        strokeCap = Paint.Cap.ROUND
-        style = Paint.Style.STROKE
-    }
-    private val userJointPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ContextCompat.getColor(context, R.color.white)
-        style = Paint.Style.FILL
-    }
-
-    /** 设置引导姿势（库中原始坐标，内部转为展示坐标） */
     fun setGuidePose(pose: FloatArray?) {
         guidePose = pose?.let { PoseComparator.guideForDisplay(it) }
         invalidate()
@@ -1087,48 +1599,59 @@ class SkeletonOverlayView @JvmOverloads constructor(
         invalidate()
     }
 
+    /** 屏幕归一化坐标 → 像素坐标 */
+    private fun toPixels(pose: FloatArray, w: Float, h: Float, mirrorX: Boolean): FloatArray {
+        val px = FloatArray(PoseModel.POSE_DIM)
+        for (i in 0 until PoseModel.NUM_JOINTS) {
+            val x = pose.jx(i)
+            px[i * 3] = (if (mirrorX) 1f - x else x) * w
+            px[i * 3 + 1] = pose.jy(i) * h
+            px[i * 3 + 2] = pose[i * 3 + 2]
+        }
+        return px
+    }
+
+    private fun torsoPx(p: FloatArray): Float {
+
+----- 第 32 页 -----
+        val dx = p.jx(PoseModel.NECK) - p.jx(PoseModel.PELVIS)
+        val dy = p.jy(PoseModel.NECK) - p.jy(PoseModel.PELVIS)
+        return kotlin.math.sqrt(dx * dx + dy * dy).coerceAtLeast(1f)
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val w = width.toFloat()
         val h = height.toFloat()
+        if (w <= 0 || h <= 0) return
 
-
------ 第 22 页 -----
+        // 引导剪影
         guidePose?.let { g ->
-            for ((a, b) in PoseModel.RENDER_EDGES) {
-                canvas.drawLine(g.jx(a) * w, g.jy(a) * h, g.jx(b) * w, g.jy(b) * h, guideLinePaint)
-            }
-            for (i in 0 until PoseModel.NUM_JOINTS) {
-                if (g.jx(i) == 0f && g.jy(i) == 0f) continue
-                canvas.drawCircle(g.jx(i) * w, g.jy(i) * h, 7f, guideJointPaint)
-            }
+            val px = toPixels(g, w, h, mirrorX = false)
+            BodyOutlineRenderer.draw(canvas, px, torsoPx(px), guidePalette)
         }
 
+        // 用户实时轮廓（按肢体段着色）
         val u = userPose ?: return
-        fun ux(i: Int): Float {
-            val x = u.jx(i)
-            return (if (mirror) 1f - x else x) * w
-        }
-        fun uy(i: Int) = u.jy(i) * h
-
-        val segs = PoseModel.COMPARE_SEGMENTS
+        val px = toPixels(u, w, h, mirrorX = mirror)
         val ok = segmentOk
-        // 先画参与比对的肢体段（带颜色反馈）
-        for (i in segs.indices) {
-            val s = segs[i]
-            val paint = if (ok == null || ok[i]) matchPaint else mismatchPaint
-            canvas.drawLine(ux(s.a), uy(s.a), ux(s.b), uy(s.b), paint)
+        val matchColor = ContextCompat.getColor(context, R.color.pose_match)
+        val mismatchColor = ContextCompat.getColor(context, R.color.pose_mismatch)
+        // 渲染器四肢顺序：左上臂/左前臂/右上臂/右前臂/左腿/右腿
+        // 比对段顺序：躯干/左上臂/左前臂/右上臂/右前臂/左腿/右腿 → 去掉躯干
+        val boneColors = IntArray(6) { i ->
+            val okSeg = ok == null || ok[i + 1]
+            if (okSeg) matchColor else mismatchColor
         }
-        // 再画其余连接（细白）
-        for ((a, b) in PoseModel.RENDER_EDGES) {
-            if (segs.any { it.a == a && it.b == b }) continue
-            canvas.drawLine(ux(a), uy(a), ux(b), uy(b), matchPaint.apply { alpha = 90 })
-        }
-        matchPaint.alpha = 255
-        for (i in 0 until PoseModel.NUM_JOINTS) {
-            if (u.jx(i) == 0f && u.jy(i) == 0f) continue
-            canvas.drawCircle(ux(i), uy(i), 5f, userJointPaint)
-        }
+        val torsoOk = ok == null || ok[0]
+        BodyOutlineRenderer.draw(
+            canvas, px, torsoPx(px),
+            BodyOutlineRenderer.Palette(
+                fillColor = (if (torsoOk) matchColor else mismatchColor) and 0x00FFFFFF or (0xAA shl 24),
+                strokeColor = 0x00000000,
+            ),
+            perBoneColors = boneColors,
+        )
     }
 }
 
@@ -1136,34 +1659,53 @@ class SkeletonOverlayView @JvmOverloads constructor(
 
 package com.poseadvisor.app.ui
 
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
+
+----- 第 33 页 -----
 import android.widget.ImageView
 import android.widget.TextView
 import androidx.recyclerview.widget.RecyclerView
 import com.poseadvisor.app.R
-
------ 第 23 页 -----
 import com.poseadvisor.app.pose.PoseEntry
 
-/** 底部姿势推荐卡条 */
+/** 底部姿势推荐卡条（支持库姿势与 AI 合成姿势混合展示） */
 class PoseStripAdapter(
     private val onSelect: (PoseEntry) -> Unit,
 ) : RecyclerView.Adapter<PoseStripAdapter.VH>() {
 
-    private var items: List<PoseEntry> = emptyList()
+    /** 卡片条目：库姿势（assets 缩略图）或 AI 合成姿势（内存 Bitmap） */
+    data class Item(
+        val entry: PoseEntry,
+        val synthesizedBitmap: Bitmap? = null,
+    )
+
+    private var items: List<Item> = emptyList()
     var selectedId: String? = null
         private set
 
-    fun submit(list: List<PoseEntry>) {
-        items = list
-        selectedId = list.firstOrNull()?.id
+    fun submit(entries: List<PoseEntry>, synthesized: List<Pair<PoseEntry, Bitmap>> = emptyList()) {
+        val synItems = synthesized.map { (e, b) -> Item(e, b) }
+        items = synItems + entries.map { Item(it) }
+        selectedId = items.firstOrNull()?.entry?.id
         notifyDataSetChanged()
     }
 
-    fun current(): PoseEntry? = items.firstOrNull { it.id == selectedId }
+    fun current(): PoseEntry? = items.firstOrNull { it.entry.id == selectedId }?.entry
+
+    fun indexOfCurrent(): Int = items.indexOfFirst { it.entry.id == selectedId }
+
+    /** 智能推荐自动轮换时同步卡片选中态（不触发点击回调） */
+    fun selectById(id: String) {
+        val old = selectedId
+        if (old == id) return
+        selectedId = id
+        notifyItemChanged(items.indexOfFirst { it.entry.id == old })
+        notifyItemChanged(items.indexOfFirst { it.entry.id == id })
+    }
 
     class VH(view: View) : RecyclerView.ViewHolder(view) {
         val thumb: ImageView = view.findViewById(R.id.poseThumb)
@@ -1175,30 +1717,34 @@ class PoseStripAdapter(
         return VH(v)
     }
 
+----- 第 34 页 -----
+
     override fun getItemCount() = items.size
 
     override fun onBindViewHolder(holder: VH, position: Int) {
         val item = items[position]
-        holder.label.text = item.label
-        try {
-            holder.itemView.context.assets.open(item.thumbnail).use { input ->
-                holder.thumb.setImageBitmap(BitmapFactory.decodeStream(input))
+        holder.label.text = item.entry.label
+        if (item.synthesizedBitmap != null) {
+            holder.thumb.setImageBitmap(item.synthesizedBitmap)
+        } else {
+            try {
+                holder.itemView.context.assets.open(item.entry.thumbnail).use { input ->
+                    holder.thumb.setImageBitmap(BitmapFactory.decodeStream(input))
+                }
+            } catch (_: Exception) {
+                holder.thumb.setImageDrawable(null)
             }
-        } catch (_: Exception) {
-            holder.thumb.setImageDrawable(null)
         }
-        val selected = item.id == selectedId
+        val selected = item.entry.id == selectedId
         holder.thumb.setBackgroundResource(
             if (selected) R.drawable.bg_pose_card_selected else R.drawable.bg_pose_card
         )
         holder.itemView.setOnClickListener {
             val old = selectedId
-            selectedId = item.id
-            notifyItemChanged(items.indexOfFirst { it.id == old })
+            selectedId = item.entry.id
+            notifyItemChanged(items.indexOfFirst { it.entry.id == old })
             notifyItemChanged(position)
-
------ 第 24 页 -----
-            onSelect(item)
+            onSelect(item.entry)
         }
     }
 }
@@ -1222,6 +1768,8 @@ import os
 import sys
 
 import numpy as np
+
+----- 第 35 页 -----
 import torch
 from PIL import Image
 
@@ -1248,8 +1796,6 @@ def image_path_to_pil_rgb(path):
     """支持中文路径的图像读取。"""
     import cv2
     data = np.fromfile(path, dtype=np.uint8)
-
------ 第 25 页 -----
     img = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(f"无法读取图像: {path}")
@@ -1274,6 +1820,8 @@ RENDER_EDGES = [
     [3, 11], [11, 14], [14, 17], [17, 19],            # 右臂
     [0, 12], [12, 7],                                  # 左腿（髋→踝）
     [0, 15], [15, 8],                                  # 右腿（髋→踝）
+
+----- 第 36 页 -----
     [5, 22],                                           # 头→鼻
 ]
 
@@ -1300,8 +1848,6 @@ def is_valid_pose(joints: np.ndarray) -> bool:
     # 头部应在骨盆上方（y 向下为正）
     if joints[5][1] > pelvis[1]:
         return False
-
------ 第 26 页 -----
     return True
 
 
@@ -1326,6 +1872,8 @@ def kmeans_numpy(feats: np.ndarray, k: int, iters: int = 50, seed: int = 0):
         probs /= probs.sum() + 1e-12
         centers.append(feats[rng.choice(n, p=probs)])
     centers = np.array(centers)
+
+----- 第 37 页 -----
     labels = np.zeros(n, dtype=int)
     for _ in range(iters):
         dist = np.linalg.norm(feats[:, None, :] - centers[None], axis=-1)
@@ -1352,8 +1900,6 @@ def cluster_features(cluster_poses: list):
         "wrist_raise": shoulder_y - wrist_min_y,      # 越大抬手越高
         "wrist_span_ratio": wrist_span / shoulder_span,
         "leg_drop": ankle_y - hip_y,                   # 越大腿越伸展
-
------ 第 27 页 -----
     }
 
 
@@ -1378,6 +1924,8 @@ def assign_categories(clusters: list) -> list:
     return cats
 
 
+
+----- 第 38 页 -----
 def pose_distance(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(a.reshape(-1) - b.reshape(-1)))
 
@@ -1404,8 +1952,6 @@ def render_thumbnail(joints: np.ndarray, out_path: str, size=512):
     fig = plt.figure(figsize=(size / 100, size / 100), dpi=100)
     ax = fig.add_axes([0, 0, 1, 1])
     ax.set_facecolor("#171A21")
-
------ 第 28 页 -----
     fig.patch.set_facecolor("#171A21")
 
     xs, ys = joints[:, 0], joints[:, 1]
@@ -1430,6 +1976,8 @@ def render_thumbnail(joints: np.ndarray, out_path: str, size=512):
 
 def main():
     ap = argparse.ArgumentParser()
+
+----- 第 39 页 -----
     ap.add_argument("--checkpoint", default="model/latest.pth")
     ap.add_argument("--image-dir", default="tools/cond_images")
     ap.add_argument("--samples-per-image", type=int, default=8)
@@ -1456,8 +2004,6 @@ def main():
         return 2
     print(f"[pose-lib] 条件图片 {len(images)} 张")
 
-
------ 第 29 页 -----
     valid = []
     total = 0
     for img_path in images:
@@ -1482,6 +2028,8 @@ def main():
     k = min(4, len(normed))
     labels, _ = kmeans_numpy(feats, k=k, seed=args.seed)
 
+
+----- 第 40 页 -----
     buckets = {key: [] for key in CATEGORY_META}
     clusters = [[normed[i] for i in np.where(labels == c)[0]] for c in range(k)]
     cat_of = assign_categories(clusters)
@@ -1508,8 +2056,6 @@ def main():
                 "id": pid,
                 "category": cat,
                 "label": f"{meta['label']}·{counters[cat]:02d}",
-
------ 第 30 页 -----
                 "thumbnail": f"poses/{thumb_name}",
                 "joints": np.round(joints, 4).tolist(),
             })
@@ -1534,6 +2080,8 @@ def main():
 if __name__ == "__main__":
     raise SystemExit(main())
 
+
+----- 第 41 页 -----
 // ===== 文件: CNN_model.py =====
 
 import torch
@@ -1560,8 +2108,6 @@ class SceneConditionedPoseVAE(nn.Module):
         # 将姿势与场景结合
         self.encoder = nn.Sequential(
             nn.Linear(pose_dim + scene_dim, 512),
-
------ 第 31 页 -----
             nn.ReLU(),
             nn.Linear(512, 256),
             nn.ReLU()
@@ -1586,6 +2132,8 @@ class SceneConditionedPoseVAE(nn.Module):
     #         inputs = self.clip_processor(images=rgb, return_tensors="pt").to(rgb.device)
     #         feat = self.clip.get_image_features(**inputs)
     #         feat = feat / feat.norm(dim=-1, keepdim=True)
+
+----- 第 42 页 -----
     #     return feat
 
     def encode_scene(self, rgb):
@@ -1612,8 +2160,6 @@ class SceneConditionedPoseVAE(nn.Module):
         logvar = self.logvar(h)
         z = self.reparameterize(mu, logvar)
         dec_input = torch.cat([z, scene_feat], dim=-1)
-
------ 第 32 页 -----
         pose_pred = self.decoder(dec_input)
         return pose_pred, mu, logvar
 
@@ -1638,6 +2184,8 @@ class SceneConditionedPoseVAE(nn.Module):
 
 # pose_utils.py — 与训练一致的 25×3 关节表示与骨架可视化
 import numpy as np
+
+----- 第 43 页 -----
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 — 注册 3d projection
 
@@ -1665,8 +2213,6 @@ def vector_to_joints(pose_vector):
     return v.reshape(v.shape[0], NUM_JOINTS, 3)
 
 
------ 第 33 页 -----
-
 def joints_to_vector(joints):
     """(25,3) 或 (B,25,3) -> (75,) 或 (B,75)"""
     j = np.asarray(joints, dtype=np.float32)
@@ -1690,6 +2236,8 @@ def plot_pose_3d(
     joints,
     title="3D pose",
     elev=20,
+
+----- 第 44 页 -----
     azim=-60,
     figsize=(6, 6),
     equal_aspect=True,
@@ -1716,8 +2264,6 @@ def plot_pose_3d(
 def plot_pose_panel(
     pose_vectors,
     titles=None,
-
------ 第 34 页 -----
     suptitle=None,
     save_path=None,
     ncols=None,
@@ -1742,6 +2288,8 @@ def plot_pose_panel(
         ax.set_title(ttl)
         max_range = np.ptp(j, axis=0).max() / 2.0 + 1e-6
         ctr = j.mean(axis=0)
+
+----- 第 45 页 -----
         ax.set_xlim(ctr[0] - max_range, ctr[0] + max_range)
         ax.set_ylim(ctr[1] - max_range, ctr[1] + max_range)
         ax.set_zlim(ctr[2] - max_range, ctr[2] + max_range)
@@ -1768,8 +2316,6 @@ def plot_pose_2d_image_plane(joints, image_shape_hw, title="2D projection (x,y i
         ax.plot([xs[a], xs[b]], [ys[a], ys[b]], "b-", linewidth=2, alpha=0.7)
     ax.scatter(xs, ys, c="red", s=40, zorder=5)
     ax.set_xlim(0, W)
-
------ 第 35 页 -----
     ax.set_ylim(H, 0)
     ax.set_aspect("equal")
     ax.set_title(title)
@@ -1794,6 +2340,8 @@ def mediapipe_to_75d_vector(landmarks):
     1: 左眼内侧 -> 23?
     2: 左眼 -> 23
     3: 左眼外侧 -> 23?
+
+----- 第 46 页 -----
     4: 右眼内侧 -> 24
     5: 右眼 -> 24
     6: 右眼外侧 -> 24?
@@ -1820,8 +2368,6 @@ def mediapipe_to_75d_vector(landmarks):
     27: 左膝 -> 4
     28: 右膝 -> 5
     29: 左踝 -> 7
-
------ 第 36 页 -----
     30: 右踝 -> 8
     31: 左脚跟 -> 20?
     32: 左脚趾 -> 20?
@@ -1846,6 +2392,8 @@ def mediapipe_to_75d_vector(landmarks):
         [13, 13],  # 左肘
         [14, 14],  # 右肘
         [15, 16],  # 左腕
+
+----- 第 47 页 -----
         [16, 17],  # 右腕
         [17, 18],  # 左手 (使用左手掌)
         [18, 19],  # 右手 (使用右手掌)
@@ -1872,8 +2420,6 @@ def mediapipe_to_75d_vector(landmarks):
     # 使用左肩、右肩、左髋、右髋的平均来估计
     left_shoulder = selected_joints[10]  # 我们的索引10对应左肩
     right_shoulder = selected_joints[11]  # 我们的索引11对应右肩
-
------ 第 37 页 -----
     left_hip = selected_joints[12]  # 我们的索引12对应左髋
     right_hip = selected_joints[15]  # 我们的索引15对应右髋
 
@@ -1898,6 +2444,8 @@ def mediapipe_to_75d_vector(landmarks):
             selected_joints[4] = (left_shoulder + right_shoulder + nose) / 3
         else:
             selected_joints[4] = (left_shoulder + right_shoulder) / 2
+
+----- 第 48 页 -----
 
         # 头部 (索引5)
         left_eye = selected_joints[23]
@@ -1925,8 +2473,6 @@ def save_as_pt(pose_vector, output_path):
     print(f"已保存为.pt格式: {output_path}")
     print(f"张量形状: {pose_tensor.shape}")
 
------ 第 38 页 -----
-
     return pose_tensor
 
 
@@ -1950,6 +2496,8 @@ def process_single_image(image_path, output_dir, pose):
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
     # 处理
+
+----- 第 49 页 -----
     results = pose.process(image_rgb)
 
     if results.pose_landmarks:
@@ -1976,8 +2524,6 @@ def process_single_image(image_path, output_dir, pose):
 
         # 同时也保存为npy格式（方便查看）
         np.save(npy_path, pose_vector)
-
------ 第 39 页 -----
         np.save(joints_path, joints_25)
 
         print(f"同时保存了npy格式: {npy_path}")
@@ -2002,6 +2548,8 @@ def visualize_pose(original_image, landmarks, joints_25, output_dir, base_name):
     # 创建可视化图
     fig = plt.figure(figsize=(20, 5))
 
+
+----- 第 50 页 -----
     # 1. 原始图像
     ax1 = fig.add_subplot(141)
     image_rgb = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
@@ -2028,8 +2576,6 @@ def visualize_pose(original_image, landmarks, joints_25, output_dir, base_name):
     # 3. 25个关节点在2D上的投影
     ax3 = fig.add_subplot(143)
     ax3.scatter(joints_25[:, 0] * image_rgb.shape[1],
-
------ 第 40 页 -----
                 joints_25[:, 1] * image_rgb.shape[0],
                 c='red', s=50)
     ax3.set_xlim(0, image_rgb.shape[1])
@@ -2054,6 +2600,8 @@ def visualize_pose(original_image, landmarks, joints_25, output_dir, base_name):
     ]
 
     for conn in connections:
+
+----- 第 51 页 -----
         if conn[0] < len(joints_25) and conn[1] < len(joints_25):
             points = np.array([joints_25[conn[0]], joints_25[conn[1]]])
             ax4.plot(points[:, 0], points[:, 1], points[:, 2], 'b-', linewidth=2, alpha=0.5)
@@ -2080,8 +2628,6 @@ def batch_process(image_dir, output_dir=None):
         output_dir = os.path.join(image_dir, 'pose_outputs')
     os.makedirs(output_dir, exist_ok=True)
 
-
------ 第 41 页 -----
     # 获取所有图片
     image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
     image_files = []
@@ -2106,6 +2652,8 @@ def batch_process(image_dir, output_dir=None):
         print(f"\n处理 [{i + 1}/{len(image_files)}]: {img_file}")
         img_path = os.path.join(image_dir, img_file)
 
+
+----- 第 52 页 -----
         result = process_single_image(img_path, output_dir, pose)
 
         if result is not None:
@@ -2132,8 +2680,6 @@ def batch_process(image_dir, output_dir=None):
 
         return all_poses
     else:
-
------ 第 42 页 -----
         print("没有成功提取到任何姿态")
         return None
 
@@ -2158,6 +2704,8 @@ def main():
         # 单张图片处理
         process_single_image(args.input, args.output_dir)
 
+
+----- 第 53 页 -----
 
 if __name__ == "__main__":
     main()
@@ -2185,8 +2733,6 @@ _POSE_LITE_URL = (
     "pose_landmarker_lite/float16/1/pose_landmarker_lite.task"
 )
 
------ 第 43 页 -----
-
 
 def _ensure_pose_landmarker_model():
     override = os.environ.get("POSE_LANDMARKER_MODEL")
@@ -2210,6 +2756,8 @@ def _ensure_pose_landmarker_model():
                         os.remove(path)
                     except OSError:
                         pass
+
+----- 第 54 页 -----
                 if attempt == 2:
                     raise
     return path
@@ -2236,8 +2784,6 @@ def _imread_unicode(path):
 def image_path_to_pil_rgb(path):
     img_bgr = _imread_unicode(path)
     if img_bgr is None:
-
------ 第 44 页 -----
         raise FileNotFoundError(f"无法读取图像: {path}")
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     return Image.fromarray(rgb)
@@ -2262,6 +2808,8 @@ def extract_pose_vector_from_image(image_path, static_image_mode=True):
         finally:
             landmarker.close()
         if not result.pose_landmarks:
+
+----- 第 55 页 -----
             return None, None
         simple = _landmarks_to_simple_list(result.pose_landmarks[0])
         vec, joints25 = mediapipe_to_75d_vector(simple)
@@ -2288,8 +2836,6 @@ def extract_pose_vector_from_image(image_path, static_image_mode=True):
 
 
 def load_model(checkpoint_path, device, pose_dim=75, latent_dim=64):
-
------ 第 45 页 -----
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     args = ckpt.get("args")
     if args is not None:
@@ -2314,6 +2860,8 @@ def run_extract(args):
     os.makedirs(args.out_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(args.image))[0]
     npy_path = os.path.join(args.out_dir, f"{base}_pose75.npy")
+
+----- 第 56 页 -----
     np.save(npy_path, vec)
     print(f"已保存训练同款 75 维向量: {npy_path} shape={vec.shape}")
     fig = plot_pose_3d(vec, title="MediaPipe -> 25x3 (训练格式)")
@@ -2340,8 +2888,6 @@ def run_generate(args, device):
 
 
 def run_reconstruct(args, device):
-
------ 第 46 页 -----
     model, pose_dim, _ = load_model(args.checkpoint, device)
     pil = image_path_to_pil_rgb(args.image)
     if args.pose_npy:
@@ -2366,6 +2912,8 @@ def run_reconstruct(args, device):
     out_png = os.path.join(args.out_dir, f"{base}_reconstruct_compare.png")
     plot_pose_panel(
         [vec, pred_np],
+
+----- 第 57 页 -----
         titles=["GT (75d 输入)", "重构输出"],
         suptitle="场景条件 VAE 重构",
         save_path=out_png,
@@ -2392,8 +2940,6 @@ def run_demo_model(args, device):
 def parse_args():
     p = argparse.ArgumentParser(description="场景条件姿态 VAE：提取 75d 关节、生成或重构并可视化")
     p.add_argument("--mode", type=str, choices=["extract", "generate", "reconstruct", "demo"], required=True)
-
------ 第 47 页 -----
     p.add_argument("--image", type=str, help="输入 RGB 场景图")
     p.add_argument("--checkpoint", type=str, help="训练保存的 .pth 文件")
     p.add_argument("--out_dir", type=str, default="infer_out", help="输出目录")
@@ -2418,6 +2964,8 @@ def main():
     )
     print(f"device={device}")
 
+
+----- 第 58 页 -----
     if args.mode == "extract":
         return run_extract(args)
     if args.mode == "generate":

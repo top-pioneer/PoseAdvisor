@@ -1,5 +1,6 @@
 package com.poseadvisor.app.ui
 
+import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.view.LayoutInflater
 import android.view.View
@@ -10,22 +11,40 @@ import androidx.recyclerview.widget.RecyclerView
 import com.poseadvisor.app.R
 import com.poseadvisor.app.pose.PoseEntry
 
-/** 底部姿势推荐卡条 */
+/** 底部姿势推荐卡条（支持库姿势与 AI 合成姿势混合展示） */
 class PoseStripAdapter(
     private val onSelect: (PoseEntry) -> Unit,
 ) : RecyclerView.Adapter<PoseStripAdapter.VH>() {
 
-    private var items: List<PoseEntry> = emptyList()
+    /** 卡片条目：库姿势（assets 缩略图）或 AI 合成姿势（内存 Bitmap） */
+    data class Item(
+        val entry: PoseEntry,
+        val synthesizedBitmap: Bitmap? = null,
+    )
+
+    private var items: List<Item> = emptyList()
     var selectedId: String? = null
         private set
 
-    fun submit(list: List<PoseEntry>) {
-        items = list
-        selectedId = list.firstOrNull()?.id
+    fun submit(entries: List<PoseEntry>, synthesized: List<Pair<PoseEntry, Bitmap>> = emptyList()) {
+        val synItems = synthesized.map { (e, b) -> Item(e, b) }
+        items = synItems + entries.map { Item(it) }
+        selectedId = items.firstOrNull()?.entry?.id
         notifyDataSetChanged()
     }
 
-    fun current(): PoseEntry? = items.firstOrNull { it.id == selectedId }
+    fun current(): PoseEntry? = items.firstOrNull { it.entry.id == selectedId }?.entry
+
+    fun indexOfCurrent(): Int = items.indexOfFirst { it.entry.id == selectedId }
+
+    /** 智能推荐自动轮换时同步卡片选中态（不触发点击回调） */
+    fun selectById(id: String) {
+        val old = selectedId
+        if (old == id) return
+        selectedId = id
+        notifyItemChanged(items.indexOfFirst { it.entry.id == old })
+        notifyItemChanged(items.indexOfFirst { it.entry.id == id })
+    }
 
     class VH(view: View) : RecyclerView.ViewHolder(view) {
         val thumb: ImageView = view.findViewById(R.id.poseThumb)
@@ -41,24 +60,28 @@ class PoseStripAdapter(
 
     override fun onBindViewHolder(holder: VH, position: Int) {
         val item = items[position]
-        holder.label.text = item.label
-        try {
-            holder.itemView.context.assets.open(item.thumbnail).use { input ->
-                holder.thumb.setImageBitmap(BitmapFactory.decodeStream(input))
+        holder.label.text = item.entry.label
+        if (item.synthesizedBitmap != null) {
+            holder.thumb.setImageBitmap(item.synthesizedBitmap)
+        } else {
+            try {
+                holder.itemView.context.assets.open(item.entry.thumbnail).use { input ->
+                    holder.thumb.setImageBitmap(BitmapFactory.decodeStream(input))
+                }
+            } catch (_: Exception) {
+                holder.thumb.setImageDrawable(null)
             }
-        } catch (_: Exception) {
-            holder.thumb.setImageDrawable(null)
         }
-        val selected = item.id == selectedId
+        val selected = item.entry.id == selectedId
         holder.thumb.setBackgroundResource(
             if (selected) R.drawable.bg_pose_card_selected else R.drawable.bg_pose_card
         )
         holder.itemView.setOnClickListener {
             val old = selectedId
-            selectedId = item.id
-            notifyItemChanged(items.indexOfFirst { it.id == old })
+            selectedId = item.entry.id
+            notifyItemChanged(items.indexOfFirst { it.entry.id == old })
             notifyItemChanged(position)
-            onSelect(item)
+            onSelect(item.entry)
         }
     }
 }

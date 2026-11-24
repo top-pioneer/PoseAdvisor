@@ -2,7 +2,6 @@ package com.poseadvisor.app.ui
 
 import android.content.Context
 import android.graphics.Canvas
-import android.graphics.Paint
 import android.util.AttributeSet
 import android.view.View
 import androidx.core.content.ContextCompat
@@ -13,9 +12,9 @@ import com.poseadvisor.app.pose.jx
 import com.poseadvisor.app.pose.jy
 
 /**
- * 姿势叠加渲染层：
- *  - 半透明品牌蓝"幽灵骨架"：用户要达成的推荐姿势
- *  - 用户实时骨架：达标肢体青色、偏差肢体橙色，逐段即时反馈
+ * 姿势叠加渲染层（丰满人形轮廓版）：
+ *  - 引导姿势：半透明品牌蓝实心人形剪影，所见即目标
+ *  - 用户姿势：实心轮廓，达标肢体青色、偏差肢体橙色，逐段即时反馈
  */
 class SkeletonOverlayView @JvmOverloads constructor(
     context: Context,
@@ -24,38 +23,14 @@ class SkeletonOverlayView @JvmOverloads constructor(
 
     private var guidePose: FloatArray? = null      // 已转为屏幕归一化坐标
     private var userPose: FloatArray? = null       // MediaPipe 原始归一化坐标
-    private var segmentOk: BooleanArray? = null
+    private var segmentOk: BooleanArray? = null    // 7 段：躯干/双臂/双腿
     private var mirror: Boolean = false
 
-    private val guideLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ContextCompat.getColor(context, R.color.pose_guide)
-        strokeWidth = 9f
-        strokeCap = Paint.Cap.ROUND
-        style = Paint.Style.STROKE
-    }
-    private val guideJointPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ContextCompat.getColor(context, R.color.brand_primary)
-        style = Paint.Style.FILL
-        alpha = 160
-    }
-    private val matchPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ContextCompat.getColor(context, R.color.pose_match)
-        strokeWidth = 8f
-        strokeCap = Paint.Cap.ROUND
-        style = Paint.Style.STROKE
-    }
-    private val mismatchPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ContextCompat.getColor(context, R.color.pose_mismatch)
-        strokeWidth = 8f
-        strokeCap = Paint.Cap.ROUND
-        style = Paint.Style.STROKE
-    }
-    private val userJointPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = ContextCompat.getColor(context, R.color.white)
-        style = Paint.Style.FILL
-    }
+    private val guidePalette = BodyOutlineRenderer.Palette(
+        fillColor = 0x555B8CFF,
+        strokeColor = 0xCC5B8CFF.toInt(),
+    )
 
-    /** 设置引导姿势（库中原始坐标，内部转为展示坐标） */
     fun setGuidePose(pose: FloatArray?) {
         guidePose = pose?.let { PoseComparator.guideForDisplay(it) }
         invalidate()
@@ -71,45 +46,56 @@ class SkeletonOverlayView @JvmOverloads constructor(
         invalidate()
     }
 
+    /** 屏幕归一化坐标 → 像素坐标 */
+    private fun toPixels(pose: FloatArray, w: Float, h: Float, mirrorX: Boolean): FloatArray {
+        val px = FloatArray(PoseModel.POSE_DIM)
+        for (i in 0 until PoseModel.NUM_JOINTS) {
+            val x = pose.jx(i)
+            px[i * 3] = (if (mirrorX) 1f - x else x) * w
+            px[i * 3 + 1] = pose.jy(i) * h
+            px[i * 3 + 2] = pose[i * 3 + 2]
+        }
+        return px
+    }
+
+    private fun torsoPx(p: FloatArray): Float {
+        val dx = p.jx(PoseModel.NECK) - p.jx(PoseModel.PELVIS)
+        val dy = p.jy(PoseModel.NECK) - p.jy(PoseModel.PELVIS)
+        return kotlin.math.sqrt(dx * dx + dy * dy).coerceAtLeast(1f)
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         val w = width.toFloat()
         val h = height.toFloat()
+        if (w <= 0 || h <= 0) return
 
+        // 引导剪影
         guidePose?.let { g ->
-            for ((a, b) in PoseModel.RENDER_EDGES) {
-                canvas.drawLine(g.jx(a) * w, g.jy(a) * h, g.jx(b) * w, g.jy(b) * h, guideLinePaint)
-            }
-            for (i in 0 until PoseModel.NUM_JOINTS) {
-                if (g.jx(i) == 0f && g.jy(i) == 0f) continue
-                canvas.drawCircle(g.jx(i) * w, g.jy(i) * h, 7f, guideJointPaint)
-            }
+            val px = toPixels(g, w, h, mirrorX = false)
+            BodyOutlineRenderer.draw(canvas, px, torsoPx(px), guidePalette)
         }
 
+        // 用户实时轮廓（按肢体段着色）
         val u = userPose ?: return
-        fun ux(i: Int): Float {
-            val x = u.jx(i)
-            return (if (mirror) 1f - x else x) * w
-        }
-        fun uy(i: Int) = u.jy(i) * h
-
-        val segs = PoseModel.COMPARE_SEGMENTS
+        val px = toPixels(u, w, h, mirrorX = mirror)
         val ok = segmentOk
-        // 先画参与比对的肢体段（带颜色反馈）
-        for (i in segs.indices) {
-            val s = segs[i]
-            val paint = if (ok == null || ok[i]) matchPaint else mismatchPaint
-            canvas.drawLine(ux(s.a), uy(s.a), ux(s.b), uy(s.b), paint)
+        val matchColor = ContextCompat.getColor(context, R.color.pose_match)
+        val mismatchColor = ContextCompat.getColor(context, R.color.pose_mismatch)
+        // 渲染器四肢顺序：左上臂/左前臂/右上臂/右前臂/左腿/右腿
+        // 比对段顺序：躯干/左上臂/左前臂/右上臂/右前臂/左腿/右腿 → 去掉躯干
+        val boneColors = IntArray(6) { i ->
+            val okSeg = ok == null || ok[i + 1]
+            if (okSeg) matchColor else mismatchColor
         }
-        // 再画其余连接（细白）
-        for ((a, b) in PoseModel.RENDER_EDGES) {
-            if (segs.any { it.a == a && it.b == b }) continue
-            canvas.drawLine(ux(a), uy(a), ux(b), uy(b), matchPaint.apply { alpha = 90 })
-        }
-        matchPaint.alpha = 255
-        for (i in 0 until PoseModel.NUM_JOINTS) {
-            if (u.jx(i) == 0f && u.jy(i) == 0f) continue
-            canvas.drawCircle(ux(i), uy(i), 5f, userJointPaint)
-        }
+        val torsoOk = ok == null || ok[0]
+        BodyOutlineRenderer.draw(
+            canvas, px, torsoPx(px),
+            BodyOutlineRenderer.Palette(
+                fillColor = (if (torsoOk) matchColor else mismatchColor) and 0x00FFFFFF or (0xAA shl 24),
+                strokeColor = 0x00000000,
+            ),
+            perBoneColors = boneColors,
+        )
     }
 }
