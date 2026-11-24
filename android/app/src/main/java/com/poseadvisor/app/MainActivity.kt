@@ -32,7 +32,7 @@ import com.poseadvisor.app.pose.PoseLibrary
 import com.poseadvisor.app.pose.PoseRecommender
 import com.poseadvisor.app.pose.PoseSynthesizer
 import com.poseadvisor.app.scene.SceneClassifier
-import com.poseadvisor.app.ui.BodyOutlineRenderer
+import com.poseadvisor.app.ui.MeshPoseRenderer
 import com.poseadvisor.app.ui.PoseStripAdapter
 import com.poseadvisor.app.ui.SkeletonOverlayView
 
@@ -98,6 +98,7 @@ class MainActivity : AppCompatActivity() {
         poseStrip = findViewById(R.id.poseStrip)
 
         library = PoseLibrary.load(this)
+        MeshPoseRenderer.init(this)
         setupPoseStrip()
 
         cameraController = CameraController(this, this, previewView) { image ->
@@ -174,12 +175,11 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, "已按场景智能推荐姿势", Toast.LENGTH_SHORT).show()
     }
 
-    /** 用解剖渲染器统一生成姿势卡片缩略图（库姿势与 AI 姿势风格一致） */
+    /** 用真人剪影渲染器统一生成姿势卡片缩略图（库姿势与 AI 姿势风格一致） */
     private fun renderCardThumb(joints: FloatArray): Bitmap {
-        return BodyOutlineRenderer.renderThumbnail(
-            joints, 192,
-            BodyOutlineRenderer.Palette(0xFF5B8CFF.toInt(), 0x00000000),
-            0xFF171A21.toInt(),
+        return MeshPoseRenderer.renderThumbnail(
+            this, joints, 192,
+            0xFF5B8CFF.toInt(), 0xFF171A21.toInt(),
         )
     }
 

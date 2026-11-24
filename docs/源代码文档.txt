@@ -1,5 +1,5 @@
 PoseAdvisor 智能拍照姿势顾问 V1.0 源代码
-（共 62 页，3061 行）
+（共 68 页，3369 行）
 
 ----- 第 1 页 -----
 // ===== 文件: android/app/src/main/AndroidManifest.xml =====
@@ -74,7 +74,7 @@ import com.poseadvisor.app.pose.PoseLibrary
 import com.poseadvisor.app.pose.PoseRecommender
 import com.poseadvisor.app.pose.PoseSynthesizer
 import com.poseadvisor.app.scene.SceneClassifier
-import com.poseadvisor.app.ui.BodyOutlineRenderer
+import com.poseadvisor.app.ui.MeshPoseRenderer
 import com.poseadvisor.app.ui.PoseStripAdapter
 import com.poseadvisor.app.ui.SkeletonOverlayView
 
@@ -142,6 +142,7 @@ class MainActivity : AppCompatActivity() {
         poseStrip = findViewById(R.id.poseStrip)
 
         library = PoseLibrary.load(this)
+        MeshPoseRenderer.init(this)
         setupPoseStrip()
 
         cameraController = CameraController(this, this, previewView) { image ->
@@ -155,9 +156,9 @@ class MainActivity : AppCompatActivity() {
 
         findViewById<ImageButton>(R.id.btnSwitchCamera).setOnClickListener {
             cameraController.switchCamera()
-            overlayView.setMirror(cameraController.isFront())
 
 ----- 第 4 页 -----
+            overlayView.setMirror(cameraController.isFront())
         }
         findViewById<ImageView>(R.id.btnShutter).setOnClickListener { captureZeroLag() }
         findViewById<ImageButton>(R.id.btnDetectScene).setOnClickListener { detectScene() }
@@ -207,9 +208,9 @@ class MainActivity : AppCompatActivity() {
         synthCounter = 0
 
         val seeds = ranked.take(4).map { it.entry }
-        // 前 3 个最契合的库姿势先行；随后穿插 AI 合成新姿势
 
 ----- 第 5 页 -----
+        // 前 3 个最契合的库姿势先行；随后穿插 AI 合成新姿势
         seeds.take(3).forEach { guideQueue.add(QueueItem(it, renderCardThumb(it.joints))) }
         if (seeds.size >= 2) addSynthesized(seeds[0], seeds[1])
         if (seeds.size >= 4) {
@@ -222,12 +223,11 @@ class MainActivity : AppCompatActivity() {
         Toast.makeText(this, "已按场景智能推荐姿势", Toast.LENGTH_SHORT).show()
     }
 
-    /** 用解剖渲染器统一生成姿势卡片缩略图（库姿势与 AI 姿势风格一致） */
+    /** 用真人剪影渲染器统一生成姿势卡片缩略图（库姿势与 AI 姿势风格一致） */
     private fun renderCardThumb(joints: FloatArray): Bitmap {
-        return BodyOutlineRenderer.renderThumbnail(
-            joints, 192,
-            BodyOutlineRenderer.Palette(0xFF5B8CFF.toInt(), 0x00000000),
-            0xFF171A21.toInt(),
+        return MeshPoseRenderer.renderThumbnail(
+            this, joints, 192,
+            0xFF5B8CFF.toInt(), 0xFF171A21.toInt(),
         )
     }
 
@@ -880,12 +880,16 @@ object PoseComparator {
     private const val OK_THRESHOLD_RAD = 0.28f   // 单段达标阈值（约16°）
     private const val SCORE_K = 2.6f             // 误差→分数的衰减系数
 
-    /** 归一化：骨盆平移到原点，按躯干长度（骨盆→颈）缩放，消除距离与身高差异 */
+    /**
+     * 归一化：骨盆平移到原点，按躯干长度（骨盆→颈）缩放，消除距离与身高差异；
+     * 再做人体工学比例矫正——将四肢骨骼长度校准到标准比例
+     * （离线生成数据肢体偏短，不矫正则引导失真、匹配度虚低）。
+
+----- 第 18 页 -----
+     */
     fun normalize(pose: FloatArray): FloatArray {
         val out = pose.copyOf()
         val px = pose.jx(PoseModel.PELVIS)
-
------ 第 18 页 -----
         val py = pose.jy(PoseModel.PELVIS)
         val torso = sqrt(
             (pose.jx(PoseModel.NECK) - px) * (pose.jx(PoseModel.NECK) - px) +
@@ -895,7 +899,63 @@ object PoseComparator {
             out[i * 3] = (pose[i * 3] - px) / torso
             out[i * 3 + 1] = (pose[i * 3 + 1] - py) / torso
         }
+        proportionCorrect(out)
         return out
+    }
+
+    /** 人体工学骨骼长度（躯干=1）：上臂 0.63，前臂 0.53，腿(髋→踝) 1.6 */
+    private val BONE_TARGETS = listOf(
+        Triple(PoseModel.SHOULDER_L, PoseModel.ELBOW_L, 0.63f),
+        Triple(PoseModel.SHOULDER_R, PoseModel.ELBOW_R, 0.63f),
+        Triple(PoseModel.ELBOW_L, PoseModel.WRIST_L, 0.53f),
+        Triple(PoseModel.ELBOW_R, PoseModel.WRIST_R, 0.53f),
+        Triple(PoseModel.HIP_L, PoseModel.ANKLE_L, 1.60f),
+        Triple(PoseModel.HIP_R, PoseModel.ANKLE_R, 1.60f),
+    )
+
+    /** 沿骨骼当前方向将远端点重定位到标准骨长（姿态方向不变，仅修比例） */
+    private fun proportionCorrect(p: FloatArray) {
+        // 解剖修正：髋线与骨盆中心齐平（生成数据的髋点偏低，会压折腿根网格）
+        p[PoseModel.HIP_L * 3 + 1] = p.jy(PoseModel.PELVIS)
+        p[PoseModel.HIP_R * 3 + 1] = p.jy(PoseModel.PELVIS)
+        for ((a, b, target) in BONE_TARGETS) {
+            val dx = p.jx(b) - p.jx(a)
+            val dy = p.jy(b) - p.jy(a)
+            val len = sqrt(dx * dx + dy * dy)
+            if (len < 1e-5f) continue
+            // 限幅缩放系数，避免异常数据被过度拉伸
+            val scale = (target / len).coerceIn(0.6f, 4.0f)
+            p[b * 3] = p.jx(a) + dx * scale
+            p[b * 3 + 1] = p.jy(a) + dy * scale
+        }
+        // 站姿约束：踝距不低于髋距 1.8 倍（与引导剪影基型一致，避免腿根网格压折）
+        val hipSpan = abs(p.jx(PoseModel.HIP_L) - p.jx(PoseModel.HIP_R))
+        val ankSpan = abs(p.jx(PoseModel.ANKLE_L) - p.jx(PoseModel.ANKLE_R))
+        val minSpan = maxOf(hipSpan * 1.8f, 0.30f)
+        if (ankSpan < minSpan) {
+            val mid = (p.jx(PoseModel.ANKLE_L) + p.jx(PoseModel.ANKLE_R)) / 2
+            val sign = if (p.jx(PoseModel.ANKLE_L) >= p.jx(PoseModel.ANKLE_R)) 1f else -1f
+            p[PoseModel.ANKLE_L * 3] = mid + sign * minSpan / 2
+
+----- 第 19 页 -----
+            p[PoseModel.ANKLE_R * 3] = mid - sign * minSpan / 2
+        }
+        // 手臂约束：肘/腕不得进入躯干侧边以内（剪影基型手臂垂于体侧，穿越躯干会压折胸腰网格）
+        val sides = listOf(
+            Triple(PoseModel.SHOULDER_L, PoseModel.HIP_L, intArrayOf(PoseModel.ELBOW_L, PoseModel.WRIST_L)),
+            Triple(PoseModel.SHOULDER_R, PoseModel.HIP_R, intArrayOf(PoseModel.ELBOW_R, PoseModel.WRIST_R)),
+        )
+        for ((sh, hp, armJoints) in sides) {
+            val side = if (p.jx(sh) >= p.jx(PoseModel.PELVIS)) 1f else -1f
+            for (jt in armJoints) {
+                val denom = p.jy(hp) - p.jy(sh)
+                val t = if (abs(denom) > 1e-5f) ((p.jy(jt) - p.jy(sh)) / denom).coerceIn(0f, 1f) else 0f
+                val xSide = p.jx(sh) + (p.jx(hp) - p.jx(sh)) * t
+                if (side * (p.jx(jt) - xSide) < 0.06f) {
+                    p[jt * 3] = xSide + side * 0.06f
+                }
+            }
+        }
     }
 
     /** 引导姿势展示坐标由 SkeletonOverlayView 按视图尺寸等比适配（见 fitGuideToView） */
@@ -928,6 +988,8 @@ object PoseComparator {
 
         val hint = if (worstIdx >= 0 && worstErr > OK_THRESHOLD_RAD) {
             val s = segs[worstIdx]
+
+----- 第 20 页 -----
             // 用远端关节的相对位移给出方向提示
             val dx = g.jx(s.b) - u.jx(s.b)
             val dy = g.jy(s.b) - u.jy(s.b)
@@ -936,8 +998,6 @@ object PoseComparator {
             } else {
                 if (dx < 0) "左" else "右"
             }
-
------ 第 19 页 -----
             "请把${s.partName}向${dir}调整"
         } else null
 
@@ -980,6 +1040,8 @@ class PoseLibrary private constructor(
             for (i in 0 until cats.length()) {
                 val c = cats.getJSONObject(i)
                 categories.add(PoseCategory(c.getString("id"), c.getString("label")))
+
+----- 第 21 页 -----
             }
 
             val poses = mutableListOf<PoseEntry>()
@@ -988,8 +1050,6 @@ class PoseLibrary private constructor(
                 val p = arr.getJSONObject(i)
                 val jarr = p.getJSONArray("joints")
                 val flat = FloatArray(PoseModel.POSE_DIM)
-
------ 第 20 页 -----
                 for (jt in 0 until PoseModel.NUM_JOINTS) {
                     val jp = jarr.getJSONArray(jt)
                     flat[jt * 3] = jp.getDouble(0).toFloat()
@@ -1033,6 +1093,8 @@ object PoseFeatures {
         val compactness: Float,   // 肢体收敛度（各关节到骨盆的平均距离，越小越收敛）
     )
 
+----- 第 22 页 -----
+
     fun of(pose75: FloatArray): Features {
         val p = PoseComparator.normalize(pose75)
         val shoulderY = (p.jy(PoseModel.SHOULDER_L) + p.jy(PoseModel.SHOULDER_R)) / 2
@@ -1040,8 +1102,6 @@ object PoseFeatures {
         val shoulderSpan = abs(p.jx(PoseModel.SHOULDER_L) - p.jx(PoseModel.SHOULDER_R)) + 1e-6f
 
         val spread = abs(p.jx(PoseModel.WRIST_L) - p.jx(PoseModel.WRIST_R)) / shoulderSpan
-
------ 第 21 页 -----
         val legSpread = abs(p.jx(PoseModel.ANKLE_L) - p.jx(PoseModel.ANKLE_R)) / shoulderSpan
 
         // 躯干与竖直方向的夹角
@@ -1085,6 +1145,8 @@ import com.poseadvisor.app.scene.SceneClassifier
  */
 object PoseRecommender {
 
+----- 第 23 页 -----
+
     data class Ranked(
         val entry: PoseEntry,
         val features: PoseFeatures.Features,
@@ -1092,8 +1154,6 @@ object PoseRecommender {
     )
 
     fun rank(library: PoseLibrary, scene: SceneClassifier.SceneProfile): List<Ranked> {
-
------ 第 22 页 -----
         return library.poses.map { entry ->
             val f = PoseFeatures.of(entry.joints)
             Ranked(entry, f, affinity(f, scene))
@@ -1136,6 +1196,8 @@ import kotlin.random.Random
  *
  * 自然性优先：任何不满足约束的结果自动回退为纯插值姿势。
  */
+
+----- 第 24 页 -----
 object PoseSynthesizer {
 
     /** 肢体段（两端关节索引 + 中文名）——长度需要锁定 */
@@ -1144,8 +1206,6 @@ object PoseSynthesizer {
         PoseModel.NECK to PoseModel.HEAD,            // 颈头
         PoseModel.SHOULDER_L to PoseModel.ELBOW_L,   // 左上臂
         PoseModel.ELBOW_L to PoseModel.WRIST_L,      // 左前臂
-
------ 第 23 页 -----
         PoseModel.SHOULDER_R to PoseModel.ELBOW_R,   // 右上臂
         PoseModel.ELBOW_R to PoseModel.WRIST_R,      // 右前臂
         PoseModel.HIP_L to PoseModel.ANKLE_L,        // 左腿
@@ -1188,6 +1248,8 @@ object PoseSynthesizer {
         val perturbed = interp.copyOf()
         val movable = intArrayOf(13, 14, 16, 17, 18, 19, 7, 8)
         for (jt in movable) {
+
+----- 第 25 页 -----
             perturbed[jt * 3] += (Random.nextFloat() - 0.5f) * 2f * noise
             perturbed[jt * 3 + 1] += (Random.nextFloat() - 0.5f) * 2f * noise
         }
@@ -1196,8 +1258,6 @@ object PoseSynthesizer {
         val natural = perturbed.copyOf()
         repeat(2) {
             projectBoneLengths(natural, reference = interp)
-
------ 第 24 页 -----
             projectAngleLimits(natural)
         }
 
@@ -1240,6 +1300,8 @@ object PoseSynthesizer {
             val rx = pose.jx(lim.to) - apexX
             val ry = pose.jy(lim.to) - apexY
             val r = sqrt(rx * rx + ry * ry)
+
+----- 第 26 页 -----
             pose[lim.to * 3] = apexX + cos(newA2) * r
             pose[lim.to * 3 + 1] = apexY + sin(newA2) * r
         }
@@ -1248,8 +1310,6 @@ object PoseSynthesizer {
     /** 自然性验收：骨骼长度误差 ≤8%，且头在骨盆上方、人体不翻转 */
     private fun isNatural(pose: FloatArray, reference: FloatArray): Boolean {
         for ((ai, bi) in BONES) {
-
------ 第 25 页 -----
             val len = dist(pose, ai, bi)
             val refLen = dist(reference, ai, bi)
             if (refLen > 1e-4f && kotlin.math.abs(len - refLen) / refLen > 0.08f) return false
@@ -1292,6 +1352,8 @@ object SceneClassifier {
 
     fun classify(frame: FrameBuffer.Frame): SceneHint {
         val data = frame.nv21
+
+----- 第 27 页 -----
         val w = frame.width
         val h = frame.height
 
@@ -1300,8 +1362,6 @@ object SceneClassifier {
         var greenCount = 0
         var skyCount = 0
         var warmCount = 0
-
------ 第 26 页 -----
         var total = 0
         var topTotal = 0
 
@@ -1344,6 +1404,8 @@ object SceneClassifier {
 
         val label = when {
             profile.greenRatio > 0.25f -> "户外自然"
+
+----- 第 28 页 -----
             profile.skyRatio > 0.30f -> "开阔天空"
             profile.warmRatio > 0.30f -> "暖调氛围"
             profile.brightness < 0.33f -> "室内弱光"
@@ -1352,87 +1414,271 @@ object SceneClassifier {
         }
         return SceneHint(label, profile)
     }
+}
 
------ 第 27 页 -----
+// ===== 文件: android/app/src/main/java/com/poseadvisor/app/ui/MeshPoseRenderer.kt =====
+
+package com.poseadvisor.app.ui
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffColorFilter
+import android.graphics.RectF
+import com.poseadvisor.app.pose.PoseComparator
+import com.poseadvisor.app.pose.PoseModel
+import com.poseadvisor.app.pose.jx
+import com.poseadvisor.app.pose.jy
+import org.json.JSONObject
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.pow
+import kotlin.math.sqrt
+
+/**
+ * 真人剪影姿势渲染器：
+ * 内置公有领域真人剪影（Wikimedia Commons, Public Domain），
+ * 用 Moving Least Squares（Schaefer 2006, affine）把剪影网格
+ * 变形到目标姿势，经 Canvas.drawBitmapMesh 渲染。
+ * 引导人形 = 真实人体轮廓，而非几何拼接。
+ */
+object MeshPoseRenderer {
+
+    private const val MESH_W = 7          // drawBitmapMesh 横向格数
+    private const val MESH_H = 11         // 纵向格数
+    private const val MLS_EPS = 900f      // 权重平滑（像素平方），防近锚点爆炸
+
+    private var bitmap: Bitmap? = null
+    private var basePts = FloatArray(0)   // 锚点基坐标（位图像素）N*2
+    private var ruleA = IntArray(0)
+    private var ruleB = IntArray(0)
+    private var ruleS = FloatArray(0)
+
+----- 第 29 页 -----
+    private var ruleR = FloatArray(0)
+    private var srcGrid = FloatArray(0)   // 源网格顶点（位图坐标，行优先）
+
+    @Volatile
+    private var initialized = false
+
+    fun init(context: Context) {
+        if (initialized) return
+        synchronized(this) {
+            if (initialized) return
+            bitmap = BitmapFactory.decodeStream(context.assets.open("silhouette.png"))
+            val text = context.assets.open("silhouette_anchors.json").bufferedReader().use { it.readText() }
+            val arr = JSONObject(text).getJSONArray("anchors")
+            val n = arr.length()
+            basePts = FloatArray(n * 2)
+            ruleA = IntArray(n); ruleB = IntArray(n)
+            ruleS = FloatArray(n); ruleR = FloatArray(n)
+            val bw = bitmap!!.width
+            val bh = bitmap!!.height
+            for (i in 0 until n) {
+                val a = arr.getJSONObject(i)
+                val base = a.getJSONArray("base")
+                basePts[i * 2] = base.getDouble(0).toFloat() * bw
+                basePts[i * 2 + 1] = base.getDouble(1).toFloat() * bh
+                val rule = a.getJSONArray("rule")
+                ruleA[i] = rule.getInt(0)
+                ruleB[i] = rule.getInt(1)
+                ruleS[i] = rule.getDouble(2).toFloat()
+                ruleR[i] = rule.getDouble(3).toFloat()
+            }
+            // 源网格（行优先，(MESH_H+1) 行 (MESH_W+1) 列）
+            val verts = FloatArray((MESH_W + 1) * (MESH_H + 1) * 2)
+            var k = 0
+            for (r in 0..MESH_H) {
+                for (c in 0..MESH_W) {
+                    verts[k++] = c * (bw - 1).toFloat() / MESH_W
+                    verts[k++] = r * (bh - 1).toFloat() / MESH_H
+                }
+            }
+            srcGrid = verts
+            initialized = true
+        }
+    }
+
+    /** 锚点目标位置（归一化姿势空间，x 已镜像对齐剪影标注方向） */
+    private fun anchorTargets(pose: FloatArray): FloatArray {
+        val n = ruleA.size
+        val out = FloatArray(n * 2)
+        for (i in 0 until n) {
+            val ai = ruleA[i]; val bi = ruleB[i]
+
+----- 第 30 页 -----
+            val ax = pose.jx(ai); val ay = pose.jy(ai)
+            val dx = pose.jx(bi) - ax; val dy = pose.jy(bi) - ay
+            val len = sqrt(dx * dx + dy * dy)
+            if (len < 1e-6f) {
+                out[i * 2] = ax; out[i * 2 + 1] = ay
+            } else {
+                val px = -dy / len; val py = dx / len
+                out[i * 2] = ax + dx * ruleS[i] + px * ruleR[i]
+                out[i * 2 + 1] = ay + dy * ruleS[i] + py * ruleR[i]
+            }
+        }
+        return out
+    }
+
+    /** Schaefer MLS-affine：把源网格顶点变形到目标锚点定义的姿势 */
+    private fun mlsWarp(tgt: FloatArray): FloatArray {
+        val nVerts = srcGrid.size / 2
+        val n = basePts.size / 2
+        val out = FloatArray(srcGrid.size)
+        val w = FloatArray(n)
+        for (k in 0 until nVerts) {
+            val vx = srcGrid[k * 2]; val vy = srcGrid[k * 2 + 1]
+            var wsum = 0f
+            var psx = 0f; var psy = 0f; var qsx = 0f; var qsy = 0f
+            for (i in 0 until n) {
+                val dx = basePts[i * 2] - vx
+                val dy = basePts[i * 2 + 1] - vy
+                val wi = 1f / (dx * dx + dy * dy + MLS_EPS)
+                w[i] = wi
+                wsum += wi
+                psx += wi * basePts[i * 2]; psy += wi * basePts[i * 2 + 1]
+                qsx += wi * tgt[i * 2]; qsy += wi * tgt[i * 2 + 1]
+            }
+            psx /= wsum; psy /= wsum; qsx /= wsum; qsy /= wsum
+            // M = (Σw Ph^T Ph)^{-1} · (Σw Ph^T Qh)
+            var m2a = 0f; var m2b = 0f; var m2c = 0f
+            var m1a = 0f; var m1b = 0f; var m1c = 0f; var m1d = 0f
+            for (i in 0 until n) {
+                val wi = w[i]
+                val px = basePts[i * 2] - psx; val py = basePts[i * 2 + 1] - psy
+                val qx = tgt[i * 2] - qsx; val qy = tgt[i * 2 + 1] - qsy
+                m2a += wi * px * px; m2b += wi * px * py; m2c += wi * py * py
+                m1a += wi * px * qx; m1b += wi * px * qy
+                m1c += wi * py * qx; m1d += wi * py * qy
+            }
+            // 2x2 逆矩阵
+            val det = m2a * m2c - m2b * m2b + 1e-8f
+            val i2a = m2c / det; val i2b = -m2b / det; val i2c = m2a / det
+            val ma = i2a * m1a + i2b * m1c
+            val mb = i2a * m1b + i2b * m1d
+
+----- 第 31 页 -----
+            val mc = i2b * m1a + i2c * m1c
+            val md = i2b * m1b + i2c * m1d
+            val rx = vx - psx; val ry = vy - psy
+            out[k * 2] = rx * ma + ry * mc + qsx
+            out[k * 2 + 1] = rx * mb + ry * md + qsy
+        }
+        return out
+    }
+
+    // 变形结果缓存：引导姿势不常变，避免每帧重复 MLS 计算
+    private var cachedPoseRef: FloatArray? = null
+    private var cachedRectKey = 0
+    private var cachedVerts: FloatArray? = null
+
+    /**
+     * 将姿势（75 维原始坐标）绘制到目标矩形区域。
+     * @param destRect 位图完整帧在画布上的位置（保持位图宽高比由调用方决定）
+     */
+    fun draw(
+        canvas: Canvas,
+        pose75: FloatArray,
+        destRect: RectF,
+        tintColor: Int,
+        alpha: Int = 0xB0,
+    ) {
+        if (!initialized) return
+        val bmp = bitmap ?: return
+
+        val rectKey = destRect.hashCode()
+        val verts = if (cachedPoseRef === pose75 && cachedRectKey == rectKey && cachedVerts != null) {
+            cachedVerts!!
+        } else {
+            // 归一化 + 比例矫正 + 镜像（对齐剪影标注方向）
+            val pose = PoseComparator.normalize(pose75)
+            for (i in 0 until PoseModel.NUM_JOINTS) pose[i * 3] = -pose[i * 3]
+
+            val tgt = anchorTargets(pose)
+            // 目标锚点（躯干单位）→ 目标矩形内像素
+            var minX = Float.MAX_VALUE; var maxX = -Float.MAX_VALUE
+            var minY = Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
+            for (i in 0 until tgt.size / 2) {
+                minX = min(minX, tgt[i * 2]); maxX = max(maxX, tgt[i * 2])
+                minY = min(minY, tgt[i * 2 + 1]); maxY = max(maxY, tgt[i * 2 + 1])
+            }
+            val spanY = (maxY - minY).coerceAtLeast(1e-3f)
+            val scale = destRect.height() * 0.94f / spanY
+            val cx = (minX + maxX) / 2; val cy = (minY + maxY) / 2
+            val dcx = destRect.centerX(); val dcy = destRect.centerY()
+            for (i in 0 until tgt.size / 2) {
+                tgt[i * 2] = (tgt[i * 2] - cx) * scale + dcx
+
+----- 第 32 页 -----
+                tgt[i * 2 + 1] = (tgt[i * 2 + 1] - cy) * scale + dcy
+            }
+            val v = mlsWarp(tgt)
+            cachedPoseRef = pose75
+            cachedRectKey = rectKey
+            cachedVerts = v
+            v
+        }
+
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
+            colorFilter = PorterDuffColorFilter(tintColor, PorterDuff.Mode.SRC_IN)
+            this.alpha = alpha
+        }
+        canvas.drawBitmapMesh(bmp, MESH_W, MESH_H, verts, 0, null, 0, paint)
+    }
+
+    /** 位图宽高比（w/h），未初始化返回 0 */
+    fun bitmapAspect(): Float {
+        val b = bitmap ?: return 0f
+        return if (b.height > 0) b.width.toFloat() / b.height else 0f
+    }
+
+    /** 渲染姿势缩略图（供卡片显示） */
+    fun renderThumbnail(context: Context, pose75: FloatArray, sizePx: Int, tintColor: Int, bgColor: Int): Bitmap {
+        init(context)
+        val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bmp)
+        canvas.drawColor(bgColor)
+        val margin = sizePx * 0.04f
+        draw(canvas, pose75, RectF(margin, margin, sizePx - margin, sizePx - margin), tintColor, 0xFF)
+        return bmp
+    }
 }
 
 // ===== 文件: android/app/src/main/java/com/poseadvisor/app/ui/BodyOutlineRenderer.kt =====
 
 package com.poseadvisor.app.ui
 
-import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Path
 import com.poseadvisor.app.pose.PoseModel
 import com.poseadvisor.app.pose.jx
 import com.poseadvisor.app.pose.jy
-import kotlin.math.sqrt
 
 /**
- * 参数化解剖人形渲染器：
- * 以 25 关节为骨架，按人体解剖宽度剖面（肩/肘/腕/髋/膝/踝各段宽度）
- * 沿骨骼法向偏移生成轮廓控制点，贝塞尔平滑为闭合的真人形剪影。
- * 支持任意姿势（含 AI 合成姿势）实时变形，无需任何图片资源。
+ * 用户实时人体渲染器：
+ * 将被摄者的实时姿态绘制为实心人体（渐细胶囊四肢 + 躯干梯形 + 头部），
+ * 按肢体段着色（达标青 / 偏差橙），用于匹配反馈。
+ * 引导姿势的真人剪影渲染见 MeshPoseRenderer。
+
+----- 第 33 页 -----
  */
 object BodyOutlineRenderer {
 
-    data class Palette(
-        val fillColor: Int,
-        val strokeColor: Int,
-    )
-
-    // ---- 解剖宽度剖面（单位：躯干长度 骨盆→颈）----
-    private const val HEAD_RX = 0.34f   // 头宽半径
-    private const val HEAD_RY = 0.44f   // 头高半径
-    private const val NECK_W = 0.13f    // 颈半宽
-    private const val UARM_W1 = 0.17f   // 上臂根粗
-    private const val UARM_W2 = 0.12f   // 肘粗
-    private const val FARM_W2 = 0.08f   // 腕粗
-    private const val HAND_LEN = 0.16f  // 手掌长
-    private const val TORSO_PAD = 0.05f // 胸廓外扩
-    private const val WAIST_RATIO = 0.80f // 腰相对肩宽比例
-    private const val HIP_PAD = 0.09f   // 髋外扩
-    private const val THIGH_W1 = 0.20f  // 大腿根粗
-    private const val CALF_W1 = 0.13f   // 膝粗
-    private const val CALF_W2 = 0.075f  // 踝粗
-    private const val FOOT_LEN = 0.20f  // 脚长
-
-    // ================= 引导剪影（实心人形） =================
+    // 肢体粗细剖面（单位：躯干长度 骨盆→颈）
+    private const val HEAD_RX = 0.34f
+    private const val UARM_W1 = 0.17f   // 上臂
+    private const val FARM_W2 = 0.13f   // 前臂
+    private const val THIGH_W1 = 0.20f  // 大腿
+    private const val CALF_W1 = 0.13f   // 小腿
+    private const val TORSO_PAD = 0.05f // 躯干外扩
 
     /**
-     * 绘制丰满人形轮廓。
-     * @param pose 像素坐标 75 维向量
-     * @param torsoRef 躯干长度（像素）
-
------ 第 28 页 -----
-     */
-    fun draw(canvas: Canvas, pose: FloatArray, torsoRef: Float, palette: Palette) {
-        val t = torsoRef.coerceAtLeast(1f)
-        val pts = buildOutlinePoints(pose, t)
-        val path = smoothClosedPath(pts)
-
-        val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            color = palette.fillColor
-            style = Paint.Style.FILL
-        }
-        canvas.drawPath(path, fill)
-        if (palette.strokeColor != 0) {
-            val stroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                color = palette.strokeColor
-                style = Paint.Style.STROKE
-                strokeWidth = t * 0.045f + 1f
-                strokeJoin = Paint.Join.ROUND
-            }
-            canvas.drawPath(path, stroke)
-        }
-    }
-
-    // ================= 用户实时人体（分段着色反馈） =================
-
-    /**
-     * 用户人体：同样的解剖轮廓思路，但按肢体段分组着色，
-     * 用于"达标青 / 偏差橙"的实时反馈。
+     * 绘制用户人体。
      * @param limbColors 6 个颜色：左上臂/左前臂/右上臂/右前臂/左腿/右腿
      */
     fun drawUser(
@@ -1444,20 +1690,14 @@ object BodyOutlineRenderer {
         limbColors: IntArray,
     ) {
         val t = torsoRef.coerceAtLeast(1f)
-
-        // 四肢：渐细胶囊（圆头粗线），按段着色（含髋踝中点估计的膝盖）
         drawUserLimbs(canvas, pose, t, limbColors)
 
-        // 躯干：肩-髋梯形
         val torsoPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = torsoColor
             style = Paint.Style.FILL
         }
         canvas.drawPath(torsoPath(pose, t), torsoPaint)
 
-        // 头
-
------ 第 29 页 -----
         val headPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             color = headColor
             style = Paint.Style.FILL
@@ -1468,14 +1708,16 @@ object BodyOutlineRenderer {
     private fun drawUserLimbs(canvas: Canvas, pose: FloatArray, t: Float, limbColors: IntArray) {
         val kneeL = kneeOf(pose, true)
         val kneeR = kneeOf(pose, false)
-        // (ax,ay,bx,by,widthRatio,colorIdx)
+        // (ax, ay, bx, by, widthRatio, colorIdx)
         val segs = listOf(
             floatArrayOf(pose.jx(PoseModel.SHOULDER_L), pose.jy(PoseModel.SHOULDER_L), pose.jx(PoseModel.ELBOW_L), pose.jy(PoseModel.ELBOW_L), UARM_W1, 0f),
-            floatArrayOf(pose.jx(PoseModel.ELBOW_L), pose.jy(PoseModel.ELBOW_L), pose.jx(PoseModel.WRIST_L), pose.jy(PoseModel.WRIST_L), FARM_W2 * 1.6f, 1f),
+            floatArrayOf(pose.jx(PoseModel.ELBOW_L), pose.jy(PoseModel.ELBOW_L), pose.jx(PoseModel.WRIST_L), pose.jy(PoseModel.WRIST_L), FARM_W2, 1f),
             floatArrayOf(pose.jx(PoseModel.SHOULDER_R), pose.jy(PoseModel.SHOULDER_R), pose.jx(PoseModel.ELBOW_R), pose.jy(PoseModel.ELBOW_R), UARM_W1, 2f),
-            floatArrayOf(pose.jx(PoseModel.ELBOW_R), pose.jy(PoseModel.ELBOW_R), pose.jx(PoseModel.WRIST_R), pose.jy(PoseModel.WRIST_R), FARM_W2 * 1.6f, 3f),
+            floatArrayOf(pose.jx(PoseModel.ELBOW_R), pose.jy(PoseModel.ELBOW_R), pose.jx(PoseModel.WRIST_R), pose.jy(PoseModel.WRIST_R), FARM_W2, 3f),
             floatArrayOf(pose.jx(PoseModel.HIP_L), pose.jy(PoseModel.HIP_L), kneeL[0], kneeL[1], THIGH_W1, 4f),
             floatArrayOf(kneeL[0], kneeL[1], pose.jx(PoseModel.ANKLE_L), pose.jy(PoseModel.ANKLE_L), CALF_W1, 4f),
+
+----- 第 34 页 -----
             floatArrayOf(pose.jx(PoseModel.HIP_R), pose.jy(PoseModel.HIP_R), kneeR[0], kneeR[1], THIGH_W1, 5f),
             floatArrayOf(kneeR[0], kneeR[1], pose.jx(PoseModel.ANKLE_R), pose.jy(PoseModel.ANKLE_R), CALF_W1, 5f),
         )
@@ -1501,22 +1743,6 @@ object BodyOutlineRenderer {
         }
     }
 
-    // ================= 轮廓控制点生成 =================
-
-    private fun norm(x: Float, y: Float): FloatArray {
-        val l = sqrt(x * x + y * y)
-        return if (l < 1e-6f) floatArrayOf(0f, -1f) else floatArrayOf(x / l, y / l)
-    }
-
-
------ 第 30 页 -----
-    private fun perp(d: FloatArray) = floatArrayOf(-d[1], d[0])
-
-    private fun dot(a: FloatArray, b: FloatArray) = a[0] * b[0] + a[1] * b[1]
-
-    private fun pt(pose: FloatArray, j: Int, dx: Float, dy: Float) =
-        floatArrayOf(pose.jx(j) + dx, pose.jy(j) + dy)
-
     /** 膝盖估计：髋踝中点（25 关节格式无膝盖） */
     private fun kneeOf(pose: FloatArray, left: Boolean): FloatArray {
         val hip = if (left) PoseModel.HIP_L else PoseModel.HIP_R
@@ -1526,189 +1752,6 @@ object BodyOutlineRenderer {
             (pose.jy(hip) + pose.jy(ankle)) / 2,
         )
     }
-
-    /** 生成闭合人形轮廓控制点（从头右侧顺时针） */
-    private fun buildOutlinePoints(pose: FloatArray, t: Float): List<FloatArray> {
-        val pts = ArrayList<FloatArray>(48)
-
-        val bodyUp = norm(
-            pose.jx(PoseModel.NECK) - pose.jx(PoseModel.PELVIS),
-            pose.jy(PoseModel.NECK) - pose.jy(PoseModel.PELVIS)
-        )
-        val sideL = perp(bodyUp) // 体侧方向（画面左）
-
-        val head = floatArrayOf(pose.jx(PoseModel.HEAD), pose.jy(PoseModel.HEAD))
-        val pelvis = floatArrayOf(pose.jx(PoseModel.PELVIS), pose.jy(PoseModel.PELVIS))
-
-        val halfShoulder = (distOf(pose, PoseModel.SHOULDER_L, PoseModel.SHOULDER_R) / 2)
-        val halfHip = (distOf(pose, PoseModel.HIP_L, PoseModel.HIP_R) / 2)
-
-        // ---- 头部（右→顶→左）----
-        val headRx = HEAD_RX * t
-        val headRy = HEAD_RY * t
-        fun headPt(u: Float, l: Float) = floatArrayOf(
-            head[0] + bodyUp[0] * u + sideL[0] * l,
-            head[1] + bodyUp[1] * u + sideL[1] * l
-        )
-        val neckR = pt(pose, PoseModel.NECK, -sideL[0] * NECK_W * t, -sideL[1] * NECK_W * t)
-        val neckL = pt(pose, PoseModel.NECK, sideL[0] * NECK_W * t, sideL[1] * NECK_W * t)
-
-        // ---- 手臂链 ----
-        fun armChain(shoulder: Int, elbow: Int, wrist: Int, outSign: Float): List<FloatArray> {
-            val s = floatArrayOf(pose.jx(shoulder), pose.jy(shoulder))
-            val e = floatArrayOf(pose.jx(elbow), pose.jy(elbow))
-            val w = floatArrayOf(pose.jx(wrist), pose.jy(wrist))
-            val u1 = norm(e[0] - s[0], e[1] - s[1])
-            var n1 = perp(u1)
-
------ 第 31 页 -----
-            // 法向朝外：与体侧方向同号
-            if (dot(n1, floatArrayOf(sideL[0] * outSign, sideL[1] * outSign)) < 0) {
-                n1 = floatArrayOf(-n1[0], -n1[1])
-            }
-            val u2 = norm(w[0] - e[0], w[1] - e[1])
-            var n2 = perp(u2)
-            if (dot(n2, n1) < 0) n2 = floatArrayOf(-n2[0], -n2[1])
-
-            val handTip = floatArrayOf(w[0] + u2[0] * HAND_LEN * t, w[1] + u2[1] * HAND_LEN * t)
-            return listOf(
-                floatArrayOf(s[0] + n1[0] * UARM_W1 * t, s[1] + n1[1] * UARM_W1 * t),      // 肩外
-                floatArrayOf(e[0] + n1[0] * UARM_W2 * t, e[1] + n1[1] * UARM_W2 * t),      // 肘外
-                floatArrayOf(w[0] + n2[0] * FARM_W2 * t, w[1] + n2[1] * FARM_W2 * t),      // 腕外
-                handTip,                                                                    // 指尖
-                floatArrayOf(w[0] - n2[0] * FARM_W2 * t, w[1] - n2[1] * FARM_W2 * t),      // 腕内
-                floatArrayOf(e[0] - n1[0] * UARM_W2 * t, e[1] - n1[1] * UARM_W2 * t),      // 肘内
-                floatArrayOf(s[0] - n1[0] * UARM_W1 * t * 0.75f, s[1] - n1[1] * UARM_W1 * t * 0.75f), // 腋窝
-            )
-        }
-
-        // ---- 腿链 ----
-        fun legChain(hip: Int, ankle: Int, outSign: Float): List<FloatArray> {
-            val h = floatArrayOf(pose.jx(hip), pose.jy(hip))
-            val a = floatArrayOf(pose.jx(ankle), pose.jy(ankle))
-            val k = floatArrayOf((h[0] + a[0]) / 2, (h[1] + a[1]) / 2)
-            val u3 = norm(k[0] - h[0], k[1] - h[1])
-            var n3 = perp(u3)
-            if (dot(n3, floatArrayOf(sideL[0] * outSign, sideL[1] * outSign)) < 0) {
-                n3 = floatArrayOf(-n3[0], -n3[1])
-            }
-            val u4 = norm(a[0] - k[0], a[1] - k[1])
-            var n4 = perp(u4)
-            if (dot(n4, n3) < 0) n4 = floatArrayOf(-n4[0], -n4[1])
-
-            // 脚尖：沿小腿方向 + 略外撇
-            val toeDir = norm(u4[0] + n3[0] * 0.5f, u4[1] + n3[1] * 0.5f)
-            val toe = floatArrayOf(a[0] + toeDir[0] * FOOT_LEN * t, a[1] + toeDir[1] * FOOT_LEN * t)
-
-            return listOf(
-                floatArrayOf(h[0] + n3[0] * THIGH_W1 * t, h[1] + n3[1] * THIGH_W1 * t),     // 髋外
-                floatArrayOf(k[0] + n3[0] * CALF_W1 * t, k[1] + n3[1] * CALF_W1 * t),       // 膝外
-                floatArrayOf(a[0] + n4[0] * CALF_W2 * t, a[1] + n4[1] * CALF_W2 * t),       // 踝外
-                toe,                                                                         // 脚尖
-                floatArrayOf(a[0] - n4[0] * CALF_W2 * t, a[1] - n4[1] * CALF_W2 * t),       // 踝内
-                floatArrayOf(k[0] - n3[0] * CALF_W1 * t, k[1] - n3[1] * CALF_W1 * t),       // 膝内
-            )
-        }
-
-        // ---- 躯干侧边（腋窝→髋）----
-        fun torsoSide(outSign: Float): List<FloatArray> {
-
------ 第 32 页 -----
-            val sL = floatArrayOf(sideL[0] * outSign, sideL[1] * outSign)
-            val chest = pt(pose, PoseModel.CHEST, sL[0] * (halfShoulder + TORSO_PAD * t), sL[1] * (halfShoulder + TORSO_PAD * t))
-            val waist = pt(pose, PoseModel.SPINE_MID, sL[0] * halfShoulder * WAIST_RATIO, sL[1] * halfShoulder * WAIST_RATIO)
-            return listOf(chest, waist)
-        }
-
-        val armL = armChain(PoseModel.SHOULDER_L, PoseModel.ELBOW_L, PoseModel.WRIST_L, +1f)
-        val armR = armChain(PoseModel.SHOULDER_R, PoseModel.ELBOW_R, PoseModel.WRIST_R, -1f)
-        val legL = legChain(PoseModel.HIP_L, PoseModel.ANKLE_L, +1f)
-        val legR = legChain(PoseModel.HIP_R, PoseModel.ANKLE_R, -1f)
-        val torsoL = torsoSide(+1f)
-        val torsoR = torsoSide(-1f)
-
-        val crotchL = floatArrayOf(pelvis[0] + sideL[0] * halfHip * 0.25f, pelvis[1] + 0.06f * t)
-        val crotchR = floatArrayOf(pelvis[0] - sideL[0] * halfHip * 0.25f, pelvis[1] + 0.06f * t)
-
-        // 头右侧 → 右臂外 → 右手 → 右臂内 → 右躯干 → 右腿外 → 右脚 → 右腿内 →
-        // 裆 → 左腿内 → 左脚 → 左腿外 → 左躯干 → 左臂内 → 左手 → 左臂外 → 头左侧 → 头顶
-        pts += neckR
-        pts += armR.subList(0, 4)          // 肩外→肘外→腕外→指尖
-        pts += armR.subList(4, 7)          // 腕内→肘内→腋窝
-        pts += torsoR
-        pts += floatArrayOf(pose.jx(PoseModel.HIP_R) - sideL[0] * HIP_PAD * t, pose.jy(PoseModel.HIP_R) - sideL[1] * HIP_PAD * t)
-        pts += legR
-        pts += crotchR
-        pts += crotchL
-        pts += legL.asReversed()
-        pts += floatArrayOf(pose.jx(PoseModel.HIP_L) + sideL[0] * HIP_PAD * t, pose.jy(PoseModel.HIP_L) + sideL[1] * HIP_PAD * t)
-        pts += torsoL.asReversed()
-        pts += armL.subList(6, 7)          // 腋窝
-        pts += armL.subList(4, 6).asReversed() // 肘内→腕内
-        pts += armL.subList(3, 4)          // 指尖
-        pts += armL.subList(0, 3).asReversed() // 腕外→肘外→肩外
-        pts += neckL
-        // 头部五点弧（比三点更圆润，避免尖顶）
-        pts += headPt(0f, headRx)                       // 头左
-        pts += headPt(headRy * 0.72f, headRx * 0.72f)   // 左上
-        pts += headPt(headRy, 0f)                        // 头顶
-        pts += headPt(headRy * 0.72f, -headRx * 0.72f)  // 右上
-        pts += headPt(0f, -headRx)                       // 头右
-
-        return pts
-    }
-
-    /** 中点平滑法生成闭合贝塞尔路径 */
-    private fun smoothClosedPath(pts: List<FloatArray>): Path {
-        val n = pts.size
-        fun mid(a: FloatArray, b: FloatArray) = floatArrayOf((a[0] + b[0]) / 2, (a[1] + b[1]) / 2)
-        val path = Path()
-        val m0 = mid(pts[0], pts[1])
-
------ 第 33 页 -----
-        path.moveTo(m0[0], m0[1])
-        for (i in 1 until n) {
-            val m = mid(pts[i], pts[(i + 1) % n])
-            path.quadTo(pts[i][0], pts[i][1], m[0], m[1])
-        }
-        val mLast = mid(pts[n - 1], pts[0])
-        path.quadTo(pts[0][0], pts[0][1], mLast[0], mLast[1])
-        path.close()
-        return path
-    }
-
-    private fun distOf(p: FloatArray, a: Int, b: Int): Float {
-        val dx = p.jx(b) - p.jx(a); val dy = p.jy(b) - p.jy(a)
-        return sqrt(dx * dx + dy * dy)
-    }
-
-    // ================= 缩略图 =================
-
-    /** 渲染姿势缩略图（实心人形剪影，供卡片显示） */
-    fun renderThumbnail(pose75: FloatArray, sizePx: Int, palette: Palette, background: Int): Bitmap {
-        val bmp = Bitmap.createBitmap(sizePx, sizePx, Bitmap.Config.ARGB_8888)
-        val canvas = Canvas(bmp)
-        canvas.drawColor(background)
-
-        val keyIdx = intArrayOf(0, 3, 4, 5, 10, 11, 13, 14, 16, 17, 12, 15, 7, 8)
-        var minX = Float.MAX_VALUE; var maxX = -Float.MAX_VALUE
-        var minY = Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
-        for (i in keyIdx) {
-            minX = minOf(minX, pose75.jx(i)); maxX = maxOf(maxX, pose75.jx(i))
-            minY = minOf(minY, pose75.jy(i)); maxY = maxOf(maxY, pose75.jy(i))
-        }
-        val cx = (minX + maxX) / 2; val cy = (minY + maxY) / 2
-        val span = maxOf(maxX - minX, maxY - minY) * 1.3f + 1e-4f
-        val scale = sizePx / span
-
-        val px = FloatArray(PoseModel.POSE_DIM)
-        for (i in 0 until PoseModel.NUM_JOINTS) {
-            px[i * 3] = (pose75.jx(i) - cx) * scale + sizePx / 2f
-            px[i * 3 + 1] = (pose75.jy(i) - cy) * scale + sizePx / 2f
-        }
-        draw(canvas, px, distOf(px, PoseModel.PELVIS, PoseModel.NECK), palette)
-        return bmp
-    }
 }
 
 // ===== 文件: android/app/src/main/java/com/poseadvisor/app/ui/SkeletonOverlayView.kt =====
@@ -1716,9 +1759,8 @@ object BodyOutlineRenderer {
 package com.poseadvisor.app.ui
 
 import android.content.Context
-
------ 第 34 页 -----
 import android.graphics.Canvas
+import android.graphics.RectF
 import android.util.AttributeSet
 import android.view.View
 import androidx.core.content.ContextCompat
@@ -1726,13 +1768,15 @@ import com.poseadvisor.app.R
 import com.poseadvisor.app.pose.PoseComparator
 import com.poseadvisor.app.pose.PoseModel
 import com.poseadvisor.app.pose.jx
+
+----- 第 35 页 -----
 import com.poseadvisor.app.pose.jy
 import kotlin.math.max
 import kotlin.math.sqrt
 
 /**
  * 姿势叠加渲染层：
- *  - 引导姿势：实心人形剪影（参数化解剖模板），等比缩放居中，不变形
+ *  - 引导姿势：真人剪影经 MLS 网格变形（MeshPoseRenderer），等比居中
  *  - 用户姿势：按 FILL_CENTER 规则与预览画面对齐的实心人体，
  *    达标肢体青色、偏差肢体橙色
  */
@@ -1741,23 +1785,19 @@ class SkeletonOverlayView @JvmOverloads constructor(
     attrs: AttributeSet? = null,
 ) : View(context, attrs) {
 
-    private var guideNormalized: FloatArray? = null   // 归一化（躯干单位）引导姿势
-    private var guidePixels: FloatArray? = null       // 已适配当前视图尺寸的像素坐标
+    private var guideRaw: FloatArray? = null          // 引导姿势（库原始坐标）
     private var userPose: FloatArray? = null          // MediaPipe 归一化坐标（图像空间）
     private var segmentOk: BooleanArray? = null
     private var mirror: Boolean = false
     private var imageW = 0                            // 分析图像尺寸（旋转后）
     private var imageH = 0
 
-    // 引导剪影：仅填充（描边会让手臂与躯干交界处的自交线显露出来）
-    private val guidePalette = BodyOutlineRenderer.Palette(
-        fillColor = 0x705B8CFF,
-        strokeColor = 0x00000000,
-    )
+    init {
+        MeshPoseRenderer.init(context)
+    }
 
     fun setGuidePose(pose: FloatArray?) {
-        guideNormalized = pose?.let { PoseComparator.normalize(it) }
-        guidePixels = null
+        guideRaw = pose
         invalidate()
     }
 
@@ -1768,8 +1808,6 @@ class SkeletonOverlayView @JvmOverloads constructor(
     /** 设置姿态分析所用图像的尺寸（用于用户骨架与预览画面的 FILL_CENTER 对齐） */
     fun setImageSize(w: Int, h: Int) {
         if (w != imageW || h != imageH) {
-
------ 第 35 页 -----
             imageW = w; imageH = h
         }
     }
@@ -1780,32 +1818,10 @@ class SkeletonOverlayView @JvmOverloads constructor(
         invalidate()
     }
 
-    /** 引导姿势：归一化 → 等比缩放置入屏幕中央安全区（高约 62%，宽不超 85%） */
-    private fun fitGuideToView(w: Float, h: Float): FloatArray? {
-        val n = guideNormalized ?: return null
-        var minX = Float.MAX_VALUE; var maxX = -Float.MAX_VALUE
-        var minY = Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
-        for (i in 0 until PoseModel.NUM_JOINTS) {
-            minX = minOf(minX, n.jx(i)); maxX = maxOf(maxX, n.jx(i))
-            minY = minOf(minY, n.jy(i)); maxY = maxOf(maxY, n.jy(i))
-        }
-        // 头顶与脚尖在关节之外，留出余量
-        minY -= 0.5f; maxY += 0.25f
-        val bodyW = (maxX - minX).coerceAtLeast(0.5f)
-        val bodyH = (maxY - minY).coerceAtLeast(1f)
-        val scale = minOf(0.62f * h / bodyH, 0.85f * w / bodyW)
-        val cx = (minX + maxX) / 2; val cy = (minY + maxY) / 2
-
-        val px = FloatArray(PoseModel.POSE_DIM)
-        for (i in 0 until PoseModel.NUM_JOINTS) {
-            px[i * 3] = (n.jx(i) - cx) * scale + w / 2f
-            px[i * 3 + 1] = (n.jy(i) - cy) * scale + h * 0.46f
-        }
-        return px
-    }
-
     /** 用户姿势：图像归一化坐标 → 按 FILL_CENTER 裁剪规则映射到视图像素 */
     private fun userToPixels(pose: FloatArray, w: Float, h: Float): FloatArray {
+
+----- 第 36 页 -----
         val iw = if (imageW > 0) imageW.toFloat() else w
         val ih = if (imageH > 0) imageH.toFloat() else h
         val scale = max(w / iw, h / ih)
@@ -1820,8 +1836,6 @@ class SkeletonOverlayView @JvmOverloads constructor(
         return px
     }
 
-
------ 第 36 页 -----
     private fun torsoPx(p: FloatArray): Float {
         val dx = p.jx(PoseModel.NECK) - p.jx(PoseModel.PELVIS)
         val dy = p.jy(PoseModel.NECK) - p.jy(PoseModel.PELVIS)
@@ -1834,10 +1848,13 @@ class SkeletonOverlayView @JvmOverloads constructor(
         val h = height.toFloat()
         if (w <= 0 || h <= 0) return
 
-        // 引导剪影
-        if (guidePixels == null) guidePixels = fitGuideToView(w, h)
-        guidePixels?.let { px ->
-            BodyOutlineRenderer.draw(canvas, px, torsoPx(px), guidePalette)
+        // 引导剪影（真人轮廓，网格变形）
+        guideRaw?.let { g ->
+            val aspect = MeshPoseRenderer.bitmapAspect()
+            val rh = h * 0.62f
+            val rw = if (aspect > 0) rh * aspect else rh * 0.45f
+            val rect = RectF(w / 2f - rw / 2f, h * 0.46f - rh / 2f, w / 2f + rw / 2f, h * 0.46f + rh / 2f)
+            MeshPoseRenderer.draw(canvas, g, rect, 0xFF5B8CFF.toInt(), 0xB0)
         }
 
         // 用户实时人体（分段着色）
@@ -1855,6 +1872,8 @@ class SkeletonOverlayView @JvmOverloads constructor(
         BodyOutlineRenderer.drawUser(
             canvas, px, torsoPx(px),
             torsoColor = (if (torsoOk) matchColor else mismatchColor) and 0x00FFFFFF or (0x88 shl 24),
+
+----- 第 37 页 -----
             headColor = (if (torsoOk) matchColor else mismatchColor) and 0x00FFFFFF or (0x88 shl 24),
             limbColors = limbColors,
         )
@@ -1872,8 +1891,6 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.ImageView
 import android.widget.TextView
-
------ 第 37 页 -----
 import androidx.recyclerview.widget.RecyclerView
 import com.poseadvisor.app.R
 import com.poseadvisor.app.pose.PoseEntry
@@ -1907,6 +1924,8 @@ class PoseStripAdapter(
     fun selectById(id: String) {
         val old = selectedId
         if (old == id) return
+
+----- 第 38 页 -----
         selectedId = id
         notifyItemChanged(items.indexOfFirst { it.entry.id == old })
         notifyItemChanged(items.indexOfFirst { it.entry.id == id })
@@ -1924,8 +1943,6 @@ class PoseStripAdapter(
 
     override fun getItemCount() = items.size
 
-
------ 第 38 页 -----
     override fun onBindViewHolder(holder: VH, position: Int) {
         val item = items[position]
         holder.label.text = item.entry.label
@@ -1960,6 +1977,8 @@ class PoseStripAdapter(
 """
 PoseAdvisor 姿势库离线生成工具
 
+----- 第 39 页 -----
+
 利用已训练的场景条件 VAE（SceneConditionedPoseVAE）离线采样多样化人体姿势，
 经过合法性过滤、几何规则分类与多样性筛选后，导出移动端可用的姿势库资源：
   1. pose_library.json  —— 25 关节归一化坐标 + 分类元数据
@@ -1976,8 +1995,6 @@ import numpy as np
 import torch
 from PIL import Image
 
-
------ 第 39 页 -----
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from CNN_model import SceneConditionedPoseVAE  # noqa: E402
@@ -2011,6 +2028,8 @@ os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 # 25 关节语义（与 mediapipe_to_pose_vector 训练格式一致）
 JOINT_NAMES = [
     "pelvis", "spine_lower", "spine_mid", "chest", "neck", "head",
+
+----- 第 40 页 -----
     "unused_6", "ankle_left", "ankle_right", "unused_9",
     "shoulder_left", "shoulder_right", "hip_left",
     "elbow_left", "elbow_right", "hip_right",
@@ -2028,8 +2047,6 @@ RENDER_EDGES = [
     [5, 22],                                           # 头→鼻
 ]
 
-
------ 第 40 页 -----
 CATEGORY_META = {
     "standing": {"label": "气质站姿", "order": 0},
     "sitting":  {"label": "坐姿低机位", "order": 1},
@@ -2039,7 +2056,7 @@ CATEGORY_META = {
 
 
 def is_valid_pose(joints: np.ndarray) -> bool:
-    """过滤明显异常的采样结果。"""
+    """过滤明显异常的采样结果（含肢体交叉等解剖学不合理情形）。"""
     if not np.isfinite(joints).all():
         return False
     xy = joints[:, :2]
@@ -2052,6 +2069,24 @@ def is_valid_pose(joints: np.ndarray) -> bool:
         return False
     # 头部应在骨盆上方（y 向下为正）
     if joints[5][1] > pelvis[1]:
+        return False
+    # 肢体交叉检查：同侧髋/踝、肩/腕的左右顺序必须一致
+    leg_order = (joints[12][0] - joints[15][0]) * (joints[7][0] - joints[8][0])
+    if leg_order < 0:
+        return False
+    arm_order = (joints[10][0] - joints[11][0]) * (joints[16][0] - joints[17][0])
+    if arm_order < 0:
+        return False
+    # 引导剪影兼容性：腿距不过窄（避免网格折叠），站姿腿伸展充分
+    shoulder_span = abs(joints[10][0] - joints[11][0]) + 1e-6
+    ankle_span = abs(joints[7][0] - joints[8][0])
+
+----- 第 41 页 -----
+    if ankle_span < 0.35 * shoulder_span:
+        return False
+    hip_y = (joints[12][1] + joints[15][1]) / 2
+    ankle_y = (joints[7][1] + joints[8][1]) / 2
+    if ankle_y - hip_y < 0.5 * torso:
         return False
     return True
 
@@ -2080,8 +2115,6 @@ def kmeans_numpy(feats: np.ndarray, k: int, iters: int = 50, seed: int = 0):
     labels = np.zeros(n, dtype=int)
     for _ in range(iters):
         dist = np.linalg.norm(feats[:, None, :] - centers[None], axis=-1)
-
------ 第 41 页 -----
         new_labels = dist.argmin(axis=1)
         if (new_labels == labels).all():
             break
@@ -2099,6 +2132,8 @@ def cluster_features(cluster_poses: list):
     hip_y = (mean[12][1] + mean[15][1]) / 2
     ankle_y = (mean[7][1] + mean[8][1]) / 2
     wrist_min_y = min(mean[16][1], mean[17][1])
+
+----- 第 42 页 -----
     wrist_span = abs(mean[16][0] - mean[17][0])
     shoulder_span = abs(mean[10][0] - mean[11][0]) + 1e-6
     return {
@@ -2133,8 +2168,6 @@ def pose_distance(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.linalg.norm(a.reshape(-1) - b.reshape(-1)))
 
 
------ 第 42 页 -----
-
 def diversify(candidates, max_keep):
     """贪心最远点采样，保证姿势库多样性。"""
     if len(candidates) <= max_keep:
@@ -2151,6 +2184,8 @@ def diversify(candidates, max_keep):
 def render_thumbnail(joints: np.ndarray, out_path: str, size=512):
     """渲染姿势骨架缩略图（深色底 + 品牌蓝线条）。"""
     import matplotlib
+
+----- 第 43 页 -----
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
@@ -2184,8 +2219,6 @@ def main():
     ap.add_argument("--checkpoint", default="model/latest.pth")
     ap.add_argument("--image-dir", default="tools/cond_images")
     ap.add_argument("--samples-per-image", type=int, default=8)
-
------ 第 43 页 -----
     ap.add_argument("--max-per-category", type=int, default=10)
     ap.add_argument("--out-json", default="android/app/src/main/assets/pose_library.json")
     ap.add_argument("--out-thumbs", default="android/app/src/main/assets/poses")
@@ -2203,6 +2236,8 @@ def main():
         os.path.join(args.image_dir, f)
         for f in os.listdir(args.image_dir)
         if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp"))
+
+----- 第 44 页 -----
     )
     if not images:
         print("[pose-lib] 未找到条件图片", file=sys.stderr)
@@ -2236,8 +2271,6 @@ def main():
     buckets = {key: [] for key in CATEGORY_META}
     clusters = [[normed[i] for i in np.where(labels == c)[0]] for c in range(k)]
     cat_of = assign_categories(clusters)
-
------ 第 44 页 -----
     for c in range(k):
         cat = cat_of[c]
         # 库存储归一化坐标（骨盆原点 + 躯干单位长），App 端直接使用
@@ -2255,6 +2288,8 @@ def main():
         for joints in cands:
             counters[cat] += 1
             pid = f"{cat}_{counters[cat]:02d}"
+
+----- 第 45 页 -----
             thumb_name = f"{pid}.png"
             render_thumbnail(joints, os.path.join(args.out_thumbs, thumb_name))
             poses_out.append({
@@ -2285,11 +2320,296 @@ def main():
 if __name__ == "__main__":
     raise SystemExit(main())
 
+// ===== 文件: tools/prepare_silhouette.py =====
+
+# -*- coding: utf-8 -*-
+"""
+真人剪影资产制作 + MLS 网格变形离线验证
+
+1. 从 Wikimedia 公有领域剪影提取人体蒙版，裁剪并生成干净 alpha 资产
+2. 定义骨骼锚点（基图坐标 + 骨骼附着规则），导出 anchors.json
+3. 用与 App 端一致的 MLS-affine 算法把剪影变形到姿势库姿势，输出预览图
+
+素材许可：Mikael Häggström "Human body silhouette"，Public Domain（Wikimedia Commons）
+"""
+import json
+import os
+
+import cv2
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+----- 第 46 页 -----
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+SRC = os.path.join(ROOT, "tools", "silhouette_src.png")
+OUT_PNG = os.path.join(ROOT, "android", "app", "src", "main", "assets", "silhouette.png")
+OUT_ANCHORS = os.path.join(ROOT, "android", "app", "src", "main", "assets", "silhouette_anchors.json")
+
+# ---------------------------------------------------------------- 锚点定义
+# name: (base_x, base_y, [jointA, jointB, s, r])
+#   base_*：在原始剪影图上的归一化坐标（人工标注）
+#   规则：anchor = A + (B-A)*s + perp(norm(B-A))*r*torsoLen；jointA/B 为 25 关节索引；直接关节则 A=B
+PELVIS, SPINE_MID, CHEST, NECK, HEAD = 0, 2, 3, 4, 5
+ANKLE_L, ANKLE_R = 7, 8
+SHOULDER_L, SHOULDER_R, HIP_L, HIP_R = 10, 11, 12, 15
+ELBOW_L, ELBOW_R, WRIST_L, WRIST_R = 13, 14, 16, 17
+
+ANCHORS = [
+    # 头颈（基坐标经蒙版逐行实测）
+    ("head_top",  0.490, 0.010, [NECK, HEAD, 1.40, 0.0]),
+    ("head_l",    0.420, 0.060, [NECK, HEAD, 0.85, 0.30]),
+    ("head_r",    0.570, 0.060, [NECK, HEAD, 0.85, -0.30]),
+    ("jaw_l",     0.440, 0.115, [NECK, HEAD, 0.45, 0.18]),
+    ("jaw_r",     0.550, 0.115, [NECK, HEAD, 0.45, -0.18]),
+    ("neck",      0.500, 0.155, [NECK, NECK, 0.0, 0.0]),
+    # 肩臂
+    ("sh_l",      0.280, 0.190, [SHOULDER_L, SHOULDER_L, 0.0, 0.0]),
+    ("sh_r",      0.720, 0.190, [SHOULDER_R, SHOULDER_R, 0.0, 0.0]),
+    ("armpit_l",  0.240, 0.235, [NECK, SHOULDER_L, 1.05, 0.10]),
+    ("armpit_r",  0.760, 0.235, [NECK, SHOULDER_R, 1.05, -0.10]),
+    ("elb_l",     0.220, 0.330, [ELBOW_L, ELBOW_L, 0.0, 0.0]),
+    ("elb_r",     0.780, 0.330, [ELBOW_R, ELBOW_R, 0.0, 0.0]),
+    ("wri_l",     0.160, 0.475, [WRIST_L, WRIST_L, 0.0, 0.0]),
+    ("wri_r",     0.830, 0.475, [WRIST_R, WRIST_R, 0.0, 0.0]),
+    ("fin_l",     0.080, 0.550, [ELBOW_L, WRIST_L, 1.20, 0.0]),
+    ("fin_r",     0.920, 0.550, [ELBOW_R, WRIST_R, 1.20, 0.0]),
+    # 躯干
+    ("chest",     0.500, 0.270, [PELVIS, NECK, 0.72, 0.0]),
+    ("waist_l",   0.310, 0.380, [PELVIS, NECK, 0.45, 0.28]),
+    ("waist_r",   0.690, 0.380, [PELVIS, NECK, 0.45, -0.28]),
+    ("pelvis",    0.500, 0.495, [PELVIS, PELVIS, 0.0, 0.0]),
+    ("hip_l",     0.430, 0.500, [HIP_L, HIP_L, 0.0, 0.0]),
+    ("hip_r",     0.570, 0.500, [HIP_R, HIP_R, 0.0, 0.0]),
+    ("hipout_l",  0.280, 0.520, [PELVIS, HIP_L, 1.35, 0.0]),
+    ("hipout_r",  0.720, 0.520, [PELVIS, HIP_R, 1.35, 0.0]),
+    ("crotch",    0.500, 0.575, [NECK, PELVIS, 1.25, 0.0]),
+    # 腿脚
+    ("knee_l",    0.390, 0.655, [HIP_L, ANKLE_L, 0.50, 0.0]),
+    ("knee_r",    0.625, 0.655, [HIP_R, ANKLE_R, 0.50, 0.0]),
+    ("ank_l",     0.370, 0.875, [ANKLE_L, ANKLE_L, 0.0, 0.0]),
+    ("ank_r",     0.670, 0.875, [ANKLE_R, ANKLE_R, 0.0, 0.0]),
+    ("toe_l",     0.330, 0.965, [HIP_L, ANKLE_L, 1.12, 0.0]),
+
+----- 第 47 页 -----
+    ("toe_r",     0.720, 0.965, [HIP_R, ANKLE_R, 1.12, 0.0]),
+]
+
+BONE_TARGETS = [(SHOULDER_L, ELBOW_L, 0.63), (SHOULDER_R, ELBOW_R, 0.63),
+                (ELBOW_L, WRIST_L, 0.53), (ELBOW_R, WRIST_R, 0.53),
+                (HIP_L, ANKLE_L, 1.60), (HIP_R, ANKLE_R, 1.60)]
+
+
+# ---------------------------------------------------------------- 与 App 一致的姿势处理
+def normalize_pose(j):
+    out = j.copy()
+    torso = np.linalg.norm(out[NECK, :2] - out[PELVIS, :2]) + 1e-6
+    out[:, :2] = (out[:, :2] - out[PELVIS, :2]) / torso
+    # 解剖修正：髋线与骨盆中心齐平（生成数据的髋点偏低，会压折腿根网格）
+    out[HIP_L, 1] = out[PELVIS, 1]
+    out[HIP_R, 1] = out[PELVIS, 1]
+    for a, b, target in BONE_TARGETS:
+        d = out[b, :2] - out[a, :2]
+        l = np.linalg.norm(d)
+        if l < 1e-5:
+            continue
+        s = np.clip(target / l, 0.6, 4.0)
+        out[b, :2] = out[a, :2] + d * s
+    # 站姿约束：踝距不低于髋距的 1.8 倍（与引导剪影基型一致，避免腿根网格压折）
+    hip_span = abs(out[HIP_L, 0] - out[HIP_R, 0])
+    ank_span = abs(out[ANKLE_L, 0] - out[ANKLE_R, 0])
+    min_span = max(hip_span * 1.8, 0.30)
+    if ank_span < min_span:
+        mid = (out[ANKLE_L, 0] + out[ANKLE_R, 0]) / 2
+        sign = 1.0 if out[ANKLE_L, 0] >= out[ANKLE_R, 0] else -1.0
+        out[ANKLE_L, 0] = mid + sign * min_span / 2
+        out[ANKLE_R, 0] = mid - sign * min_span / 2
+    # 手臂约束：肘/腕不得进入躯干侧边以内（剪影基型手臂垂于体侧，穿越躯干会压折胸腰网格）
+    for sh, hp, el, wr in ((SHOULDER_L, HIP_L, ELBOW_L, WRIST_L),
+                           (SHOULDER_R, HIP_R, ELBOW_R, WRIST_R)):
+        side = 1.0 if out[sh, 0] >= out[PELVIS, 0] else -1.0
+        for jt in (el, wr):
+            y = out[jt, 1]
+            denom = out[hp, 1] - out[sh, 1]
+            t = np.clip((y - out[sh, 1]) / denom, 0.0, 1.0) if abs(denom) > 1e-5 else 0.0
+            x_side = out[sh, 0] + (out[hp, 0] - out[sh, 0]) * t
+            if side * (out[jt, 0] - x_side) < 0.06:
+                out[jt, 0] = x_side + side * 0.06
+    return out
+
+
+def anchor_target(rule, pose):
+    a_i, b_i, s, r = rule
+    A = pose[a_i, :2]
+    B = pose[b_i, :2]
+
+----- 第 48 页 -----
+    d = B - A
+    n = np.linalg.norm(d)
+    if n < 1e-6:
+        return A
+    perp = np.array([-d[1], d[0]]) / n
+    return A + d * s + perp * r
+
+
+# ---------------------------------------------------------------- MLS affine 变形
+def mls_affine(v, base_pts, tgt_pts, alpha=1.0, eps=900.0):
+    """v:(M,2) 网格点 base_pts/tgt_pts:(N,2) → 变形后 (M,2)
+    eps 为权重平滑项（像素平方），防止靠近锚点时权重爆炸。"""
+    N = base_pts.shape[0]
+    out = np.empty_like(v)
+    for k in range(v.shape[0]):
+        p = v[k]
+        dist2 = ((base_pts - p) ** 2).sum(axis=1)
+        w = 1.0 / (dist2 + eps) ** alpha
+        wsum = w.sum()
+        p_star = (w[:, None] * base_pts).sum(axis=0) / wsum
+        q_star = (w[:, None] * tgt_pts).sum(axis=0) / wsum
+        Ph = base_pts - p_star
+        Qh = tgt_pts - q_star
+        M1 = np.einsum("i,ij,ik->jk", w, Ph, Qh)   # Σ wi Ph^T Qh
+        M2 = np.einsum("i,ij,ik->jk", w, Ph, Ph)   # Σ wi Ph^T Ph
+        # Schaefer MLS affine: M = (Σw Ph^T Ph)^{-1} · (Σw Ph^T Qh)
+        M = np.linalg.inv(M2 + np.eye(2) * 1e-8) @ M1
+        out[k] = (p - p_star) @ M + q_star
+    return out
+
+
+# ---------------------------------------------------------------- 剪影蒙版处理
+def make_silhouette_asset():
+    img = cv2.imread(SRC, cv2.IMREAD_UNCHANGED)
+    if img is None:
+        raise FileNotFoundError(SRC)
+    h, w = img.shape[:2]
+    print(f"原图 {w}x{h}, 通道 {img.shape[2] if img.ndim == 3 else 1}")
+
+    if img.shape[2] == 4:
+        bgr = img[:, :, :3]
+        alpha0 = img[:, :, 3]
+    else:
+        bgr = img
+        alpha0 = np.full((h, w), 255, np.uint8)
+
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+    # 肤色/非白背景区域：饱和度>12 或 亮度<245，且原 alpha 可见
+    mask = (((hsv[:, :, 1] > 12) | (hsv[:, :, 2] < 245)) & (alpha0 > 10)).astype(np.uint8) * 255
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+
+----- 第 49 页 -----
+    # 最大连通域
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+    if n > 1:
+        idx = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        mask = (labels == idx).astype(np.uint8) * 255
+
+    ys, xs = np.where(mask > 0)
+    x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
+    pad = 4
+    x0, y0 = max(0, x0 - pad), max(0, y0 - pad)
+    x1, y1 = min(w - 1, x1 + pad), min(h - 1, y1 + pad)
+    crop = mask[y0:y1 + 1, x0:x1 + 1]
+    # 边缘平滑 + 2 倍放大
+    crop = cv2.GaussianBlur(crop, (5, 5), 0)
+    crop = cv2.resize(crop, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    _, crop = cv2.threshold(crop, 100, 255, cv2.THRESH_BINARY)
+
+    os.makedirs(os.path.dirname(OUT_PNG), exist_ok=True)
+    # 存为 RGBA：RGB 白 + alpha=蒙版（App 端用 PorterDuff SRC_IN 染成品牌色）
+    rgba = np.zeros((crop.shape[0], crop.shape[1], 4), np.uint8)
+    rgba[:, :, :3] = 255
+    rgba[:, :, 3] = crop
+    cv2.imwrite(OUT_PNG, rgba)
+    ch, cw = crop.shape
+    print(f"剪影资产 {cw}x{ch} → {OUT_PNG}")
+
+    # 锚点基坐标 → 裁剪框归一化
+    anchors_out = []
+    for name, bx, by, rule in ANCHORS:
+        cx = (bx * w - x0) / (x1 - x0 + 1)
+        cy = (by * h - y0) / (y1 - y0 + 1)
+        anchors_out.append({"name": name, "base": [round(cx, 4), round(cy, 4)], "rule": rule})
+    with open(OUT_ANCHORS, "w", encoding="utf-8") as f:
+        json.dump({"anchors": anchors_out}, f, ensure_ascii=False)
+    print(f"锚点 {len(anchors_out)} 个 → {OUT_ANCHORS}")
+    return crop, (x0, y0, x1, y1), (w, h)
+
+
+# ---------------------------------------------------------------- 预览
+def preview(crop, crop_box, src_wh):
+    x0, y0, x1, y1 = crop_box
+    w, h = src_wh
+    ch, cw = crop.shape
+    lib = json.load(open(os.path.join(ROOT, "android/app/src/main/assets/pose_library.json"), encoding="utf-8"))
+    picks = ["standing_01", "standing_02", "sitting_01", "gesture_01", "dynamic_01", "dynamic_03"]
+    samples = [p for p in lib["poses"] if p["id"] in picks]
+
+    base_pts = []
+    for name, bx, by, rule in ANCHORS:
+        cx = (bx * w - x0) / (x1 - x0 + 1) * cw
+
+----- 第 50 页 -----
+        cy = (by * h - y0) / (y1 - y0 + 1) * ch
+        base_pts.append([cx, cy])
+    base_pts = np.array(base_pts)
+
+    GH, GW = 12, 8
+    gx, gy = np.meshgrid(np.linspace(0, cw - 1, GW), np.linspace(0, ch - 1, GH))
+    grid = np.stack([gx.ravel(), gy.ravel()], axis=1)
+
+    fig, axes = plt.subplots(2, 3, figsize=(12, 9), facecolor="#171A21")
+    for ax, p in zip(axes.flat, samples):
+        pose = normalize_pose(np.array(p["joints"])[:, :2])
+        # MediaPipe 左/右语义相对画面是镜像的（面对镜头时其左手在画面右侧），
+        # 与剪影标注方向相反，需镜像 x 后再配对锚点
+        pose[:, 0] = -pose[:, 0]
+        tgt = np.array([anchor_target(rule, pose) for _, _, _, rule in ANCHORS])
+        # 目标锚点（躯干单位）→ 像素：身高对齐剪影高度
+        span_y = tgt[:, 1].max() - tgt[:, 1].min()
+        scale = (ch * 0.92) / max(span_y, 1e-3)
+        ctr = tgt.mean(axis=0)
+        tgt_px = (tgt - ctr) * scale + np.array([cw / 2, ch / 2])
+        warped_grid = mls_affine(grid, base_pts, tgt_px)
+
+        # 逐网格三角形仿射贴图（与 Android drawBitmapMesh 同一渲染语义）
+        warped = np.zeros_like(crop)
+        G_src = grid.reshape(GH, GW, 2)
+        G_dst = warped_grid.reshape(GH, GW, 2)
+        for r in range(GH - 1):
+            for c in range(GW - 1):
+                for tri in ([(r, c), (r, c + 1), (r + 1, c)],
+                            [(r, c + 1), (r + 1, c + 1), (r + 1, c)]):
+                    sTri = np.float32([G_src[t[0], t[1]] for t in tri])
+                    dTri = np.float32([G_dst[t[0], t[1]] for t in tri])
+                    M = cv2.getAffineTransform(sTri, dTri)
+                    piece = cv2.warpAffine(crop, M, (cw, ch), flags=cv2.INTER_LINEAR,
+                                           borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                    mask = np.zeros_like(crop)
+                    cv2.fillConvexPoly(mask, np.int32(dTri), 255)
+                    np.copyto(warped, piece, where=mask > 0)
+        rgba = np.zeros((ch, cw, 4), np.uint8)
+        rgba[:, :, 0] = rgba[:, :, 1] = rgba[:, :, 2] = 255
+        rgba[:, :, 3] = warped
+        ax.imshow(cv2.cvtColor(rgba, cv2.COLOR_BGRA2RGBA))
+        ax.axis("off")
+        ax.set_title(p["label"], color="white", fontsize=11)
+        ax.set_facecolor("#171A21")
+    plt.tight_layout()
+    out = os.path.join(ROOT, "tools", "mls_preview.png")
+    plt.savefig(out, dpi=110, facecolor="#171A21")
+    print(f"saved {out}")
+
+
+----- 第 51 页 -----
+
+if __name__ == "__main__":
+    crop, crop_box, src_wh = make_silhouette_asset()
+    preview(crop, crop_box, src_wh)
+
 // ===== 文件: CNN_model.py =====
 
 import torch
-
------ 第 45 页 -----
 import torch.nn as nn
 from transformers import CLIPModel, CLIPProcessor
 
@@ -2332,6 +2652,8 @@ class SceneConditionedPoseVAE(nn.Module):
         )
 
     # # 对数字归一化
+
+----- 第 52 页 -----
     # def encode_scene(self, rgb):
     #     with torch.no_grad():
     #         inputs = self.clip_processor(images=rgb, return_tensors="pt").to(rgb.device)
@@ -2340,8 +2662,6 @@ class SceneConditionedPoseVAE(nn.Module):
     #     return feat
 
     def encode_scene(self, rgb):
-
------ 第 46 页 -----
         with torch.no_grad():
             inputs = self.clip_processor(images=rgb, return_tensors="pt").to(self.clip.device)
             feat = self.clip.get_image_features(**inputs)
@@ -2385,6 +2705,8 @@ class SceneConditionedPoseVAE(nn.Module):
         scene_feat = self.encode_scene(rgb)
         return self.generate_with_scene_features(scene_feat, num_samples=num_samples)
 
+----- 第 53 页 -----
+
 // ===== 文件: pose_utils.py =====
 
 # pose_utils.py — 与训练一致的 25×3 关节表示与骨架可视化
@@ -2392,8 +2714,6 @@ import numpy as np
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 — 注册 3d projection
 
-
------ 第 47 页 -----
 # 与 mediapipe_to_pose_vector.visualize_pose 中骨架定义一致（与现有 poses.npy 兼容）
 SKELETON_CONNECTIONS = [
     (0, 1), (1, 2), (2, 3), (3, 4), (4, 5),
@@ -2437,6 +2757,8 @@ def _draw_skeleton_3d(ax, joints, line_color="C0", point_color="C0", linewidth=2
     ax.scatter(j[:, 0], j[:, 1], j[:, 2], c=point_color, s=28, depthshade=True, alpha=0.9)
 
 
+----- 第 54 页 -----
+
 def plot_pose_3d(
     joints,
     title="3D pose",
@@ -2444,8 +2766,6 @@ def plot_pose_3d(
     azim=-60,
     figsize=(6, 6),
     equal_aspect=True,
-
------ 第 48 页 -----
 ):
     """单幅 3D 骨架图"""
     j = vector_to_joints(joints) if np.asarray(joints).size == POSE_DIM else np.asarray(joints)
@@ -2488,6 +2808,8 @@ def plot_pose_panel(
         j = vector_to_joints(pv) if np.asarray(pv).size == POSE_DIM else np.asarray(pv)
         ax = fig.add_subplot(nrows, ncols, i + 1, projection="3d")
         c = colors[i % len(colors)]
+
+----- 第 55 页 -----
         _draw_skeleton_3d(ax, j, line_color=c, point_color=c)
         ttl = titles[i] if titles and i < len(titles) else f"Pose {i + 1}"
         ax.set_title(ttl)
@@ -2496,8 +2818,6 @@ def plot_pose_panel(
         ax.set_xlim(ctr[0] - max_range, ctr[0] + max_range)
         ax.set_ylim(ctr[1] - max_range, ctr[1] + max_range)
         ax.set_zlim(ctr[2] - max_range, ctr[2] + max_range)
-
------ 第 49 页 -----
         ax.view_init(elev=20, azim=-60)
 
     if suptitle:
@@ -2540,6 +2860,8 @@ def mediapipe_to_75d_vector(landmarks):
     将MediaPipe的33个姿态关键点转换为25个关键点的75维向量
 
     MediaPipe有33个关键点，我们选择其中25个主要的：
+
+----- 第 56 页 -----
     索引对应关系（MediaPipe索引 -> 自定义索引）：
     0: 鼻子 -> 22
     1: 左眼内侧 -> 23?
@@ -2548,8 +2870,6 @@ def mediapipe_to_75d_vector(landmarks):
     4: 右眼内侧 -> 24
     5: 右眼 -> 24
     6: 右眼外侧 -> 24?
-
------ 第 50 页 -----
     7: 左耳 -> 不使用
     8: 右耳 -> 不使用
     9: 嘴左 -> 不使用
@@ -2593,6 +2913,8 @@ def mediapipe_to_75d_vector(landmarks):
         # 脊柱 (我们通过平均来估计)
         # 我们需要估计脊柱点：骨盆、脊柱下、脊柱中、脊柱上、颈部
 
+----- 第 57 页 -----
+
         # 手臂 (6-11)
         [13, 13],  # 左肘
         [14, 14],  # 右肘
@@ -2600,8 +2922,6 @@ def mediapipe_to_75d_vector(landmarks):
         [16, 17],  # 右腕
         [17, 18],  # 左手 (使用左手掌)
         [18, 19],  # 右手 (使用右手掌)
-
------ 第 51 页 -----
 
         # 腿 (12-17)
         [27, 4],  # 左膝
@@ -2644,6 +2964,8 @@ def mediapipe_to_75d_vector(landmarks):
         selected_joints[3] = (left_shoulder + right_shoulder) / 2
 
         # 颈部 (索引4)
+
+----- 第 58 页 -----
         nose = selected_joints[22]
         if np.any(nose):
             selected_joints[4] = (left_shoulder + right_shoulder + nose) / 3
@@ -2652,8 +2974,6 @@ def mediapipe_to_75d_vector(landmarks):
 
         # 头部 (索引5)
         left_eye = selected_joints[23]
-
------ 第 52 页 -----
         right_eye = selected_joints[24]
         if np.any(left_eye) and np.any(right_eye):
             selected_joints[5] = (left_eye + right_eye) / 2 + np.array([0, 0.1, 0])  # 在眼睛上方一点
@@ -2697,6 +3017,8 @@ def process_single_image(image_path, output_dir, pose):
         print(f"无法读取图片: {image_path}")
         return None
 
+----- 第 59 页 -----
+
     # 转换为RGB
     image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
@@ -2704,8 +3026,6 @@ def process_single_image(image_path, output_dir, pose):
     results = pose.process(image_rgb)
 
     if results.pose_landmarks:
-
------ 第 53 页 -----
         # 转换为75维向量
         pose_vector, joints_25 = mediapipe_to_75d_vector(results.pose_landmarks.landmark)
 
@@ -2748,6 +3068,8 @@ def visualize_pose(original_image, landmarks, joints_25, output_dir, base_name):
     可视化检测结果
     """
     import matplotlib.pyplot as plt
+
+----- 第 60 页 -----
     from mpl_toolkits.mplot3d import Axes3D
 
     # 创建可视化图
@@ -2756,8 +3078,6 @@ def visualize_pose(original_image, landmarks, joints_25, output_dir, base_name):
     # 1. 原始图像
     ax1 = fig.add_subplot(141)
     image_rgb = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
-
------ 第 54 页 -----
     ax1.imshow(image_rgb)
     ax1.set_title('Original Image')
     ax1.axis('off')
@@ -2800,6 +3120,8 @@ def visualize_pose(original_image, landmarks, joints_25, output_dir, base_name):
         (4, 10), (10, 13), (13, 16), (16, 18),  # 左臂
         (4, 11), (11, 14), (14, 17), (17, 19),  # 右臂
         (0, 12), (12, 4), (4, 7), (7, 20),  # 左腿
+
+----- 第 61 页 -----
         (0, 15), (15, 5), (5, 8), (8, 20),  # 右腿
         (22, 23), (22, 24)  # 眼睛
     ]
@@ -2808,8 +3130,6 @@ def visualize_pose(original_image, landmarks, joints_25, output_dir, base_name):
         if conn[0] < len(joints_25) and conn[1] < len(joints_25):
             points = np.array([joints_25[conn[0]], joints_25[conn[1]]])
             ax4.plot(points[:, 0], points[:, 1], points[:, 2], 'b-', linewidth=2, alpha=0.5)
-
------ 第 55 页 -----
 
     ax4.set_title('3D Pose')
     ax4.set_xlabel('X')
@@ -2853,6 +3173,8 @@ def batch_process(image_dir, output_dir=None):
     all_poses = []
     successful = 0
 
+----- 第 62 页 -----
+
     for i, img_file in enumerate(image_files):
         print(f"\n处理 [{i + 1}/{len(image_files)}]: {img_file}")
         img_path = os.path.join(image_dir, img_file)
@@ -2860,8 +3182,6 @@ def batch_process(image_dir, output_dir=None):
         result = process_single_image(img_path, output_dir, pose)
 
         if result is not None:
-
------ 第 56 页 -----
             pose_vector, _ = result
             all_poses.append(pose_vector)
             successful += 1
@@ -2904,6 +3224,8 @@ def main():
 
     if args.batch or os.path.isdir(args.input):
         # 批量处理模式
+
+----- 第 63 页 -----
         batch_process(args.input, args.output_dir)
     else:
         # 单张图片处理
@@ -2912,8 +3234,6 @@ def main():
 
 if __name__ == "__main__":
     main()
-
------ 第 57 页 -----
 
 // ===== 文件: infer_pose.py =====
 
@@ -2956,6 +3276,8 @@ def _ensure_pose_landmarker_model():
                 if os.path.isfile(path) and os.path.getsize(path) >= min_bytes:
                     break
             except (urllib.error.ContentTooShortError, OSError):
+
+----- 第 64 页 -----
                 if os.path.isfile(path):
                     try:
                         os.remove(path)
@@ -2964,8 +3286,6 @@ def _ensure_pose_landmarker_model():
                 if attempt == 2:
                     raise
     return path
-
------ 第 58 页 -----
 
 
 def _landmarks_to_simple_list(landmarks):
@@ -3008,6 +3328,8 @@ def extract_pose_vector_from_image(image_path, static_image_mode=True):
         model_path = _ensure_pose_landmarker_model()
         landmarker = mp.tasks.vision.PoseLandmarker.create_from_model_path(model_path)
         try:
+
+----- 第 65 页 -----
             mp_img = MPImage(ImageFormat.SRGB, image_rgb)
             result = landmarker.detect(mp_img)
         finally:
@@ -3016,8 +3338,6 @@ def extract_pose_vector_from_image(image_path, static_image_mode=True):
             return None, None
         simple = _landmarks_to_simple_list(result.pose_landmarks[0])
         vec, joints25 = mediapipe_to_75d_vector(simple)
-
------ 第 59 页 -----
         return np.asarray(vec, dtype=np.float32), joints25
 
     if hasattr(mp, "solutions"):
@@ -3060,6 +3380,8 @@ def random_demo_pose(batch_size=1, device="cpu", seed=0):
 def run_extract(args):
     vec, joints = extract_pose_vector_from_image(args.image)
     if vec is None:
+
+----- 第 66 页 -----
         print("未检测到人体姿态，请换图或调低 min_detection_confidence。", file=sys.stderr)
         return 1
     os.makedirs(args.out_dir, exist_ok=True)
@@ -3068,8 +3390,6 @@ def run_extract(args):
     np.save(npy_path, vec)
     print(f"已保存训练同款 75 维向量: {npy_path} shape={vec.shape}")
     fig = plot_pose_3d(vec, title="MediaPipe -> 25x3 (训练格式)")
-
------ 第 60 页 -----
     out_png = os.path.join(args.out_dir, f"{base}_skeleton_3d.png")
     fig.savefig(out_png, dpi=150, bbox_inches="tight")
     print(f"3D 骨架图: {out_png}")
@@ -3112,6 +3432,8 @@ def run_reconstruct(args, device):
     os.makedirs(args.out_dir, exist_ok=True)
     base = os.path.splitext(os.path.basename(args.image))[0]
     np.save(os.path.join(args.out_dir, f"{base}_recon.npy"), pred_np)
+
+----- 第 67 页 -----
     err = np.linalg.norm(vector_to_joints(pred_np) - vector_to_joints(vec))
     print(f"重构 L2 (关节空间近似): {err:.6f}")
     out_png = os.path.join(args.out_dir, f"{base}_reconstruct_compare.png")
@@ -3120,8 +3442,6 @@ def run_reconstruct(args, device):
         titles=["GT (75d 输入)", "重构输出"],
         suptitle="场景条件 VAE 重构",
         save_path=out_png,
-
------ 第 61 页 -----
     )
     print(f"对比图: {out_png}")
     return 0
@@ -3164,6 +3484,8 @@ def main():
         print("该模式需要 --checkpoint", file=sys.stderr)
         return 2
 
+
+----- 第 68 页 -----
     device = torch.device(
         args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu")
     )
@@ -3172,8 +3494,6 @@ def main():
     if args.mode == "extract":
         return run_extract(args)
     if args.mode == "generate":
-
------ 第 62 页 -----
         return run_generate(args, device)
     if args.mode == "reconstruct":
         return run_reconstruct(args, device)

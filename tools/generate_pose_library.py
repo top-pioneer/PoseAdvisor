@@ -77,7 +77,7 @@ CATEGORY_META = {
 
 
 def is_valid_pose(joints: np.ndarray) -> bool:
-    """过滤明显异常的采样结果。"""
+    """过滤明显异常的采样结果（含肢体交叉等解剖学不合理情形）。"""
     if not np.isfinite(joints).all():
         return False
     xy = joints[:, :2]
@@ -90,6 +90,22 @@ def is_valid_pose(joints: np.ndarray) -> bool:
         return False
     # 头部应在骨盆上方（y 向下为正）
     if joints[5][1] > pelvis[1]:
+        return False
+    # 肢体交叉检查：同侧髋/踝、肩/腕的左右顺序必须一致
+    leg_order = (joints[12][0] - joints[15][0]) * (joints[7][0] - joints[8][0])
+    if leg_order < 0:
+        return False
+    arm_order = (joints[10][0] - joints[11][0]) * (joints[16][0] - joints[17][0])
+    if arm_order < 0:
+        return False
+    # 引导剪影兼容性：腿距不过窄（避免网格折叠），站姿腿伸展充分
+    shoulder_span = abs(joints[10][0] - joints[11][0]) + 1e-6
+    ankle_span = abs(joints[7][0] - joints[8][0])
+    if ankle_span < 0.35 * shoulder_span:
+        return False
+    hip_y = (joints[12][1] + joints[15][1]) / 2
+    ankle_y = (joints[7][1] + joints[8][1]) / 2
+    if ankle_y - hip_y < 0.5 * torso:
         return False
     return True
 

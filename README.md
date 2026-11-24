@@ -9,7 +9,7 @@
 | 实时取景 | CameraX 预览，720p 流畅帧率 |
 | **智能姿势推荐** | 场景多维特征（亮度/绿意/天空/暖色/活力）× 姿势几何特征自动亲和度排序，无需人工挑选 |
 | **AI 新创姿势** | 端上姿势合成器：种子姿势插值 + 扰动 + 生物力学约束投影（肢体长度锁定、关节角度限幅），创造姿势库中不存在但解剖学自然的新姿势，不合格自动回退 |
-| **丰满人形轮廓引导** | 引导姿势渲染为实心人形剪影（头圆 + 躯干梯形 + 四肢胶囊），而非抽象骨架，对照摆姿更直观 |
+| **真人轮廓引导** | 公有领域真人剪影经 MLS（Moving Least Squares）骨骼驱动网格变形为目标姿势，真实人体轮廓而非几何拼接 |
 | 姿势库 | 场景条件 VAE 离线生成精修，4 大类别共 40 组种子姿势 |
 | 实时匹配反馈 | MediaPipe PoseLandmarker 端上检测 33 关键点，逐肢体段着色（达标青 / 偏差橙），0-100 匹配度打分 |
 | 自动轮换引导 | 用户长时间未达标自动切换下一个候选姿势；手动选卡锁定 60 秒 |
@@ -87,3 +87,4 @@ cd android
 - 本仓库代码可用于学习与研究
 - `fit_smplx_to_pose75.py` 依赖 SMPL-X 模型，SMPL-X 有独立许可协议，需自行从 [SMPL-X 官网](https://smpl-x.is.tue.mpg.de/) 申请，**本仓库不包含亦不分发 SMPL-X 文件**
 - MediaPipe PoseLandmarker 模型文件遵循 Google MediaPipe 模型许可
+- `android/app/src/main/assets/silhouette.png` 基于 Wikimedia Commons 作品 *Human body silhouette*（作者 Mikael Häggström，[公有领域](https://commons.wikimedia.org/wiki/File:Human_body_silhouette.svg)）加工而成
