@@ -52,6 +52,9 @@ class SceneConditionedPoseVAE(nn.Module):
         with torch.no_grad():
             inputs = self.clip_processor(images=rgb, return_tensors="pt").to(self.clip.device)
             feat = self.clip.get_image_features(**inputs)
+            # transformers v5 起返回 BaseModelOutputWithPooling，取投影后特征
+            if not torch.is_tensor(feat):
+                feat = feat.pooler_output
             feat = feat / feat.norm(dim=-1, keepdim=True)
         return feat
 

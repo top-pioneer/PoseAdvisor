@@ -1,0 +1,171 @@
+<?xml version="1.0" encoding="utf-8"?>
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/surface_dark">
+
+    <!-- 相机预览 -->
+    <androidx.camera.view.PreviewView
+        android:id="@+id/previewView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- 姿势骨架叠加层（引导骨架 + 用户骨架实时反馈） -->
+    <com.poseadvisor.app.ui.SkeletonOverlayView
+        android:id="@+id/overlayView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent" />
+
+    <!-- 拍照白闪反馈 -->
+    <View
+        android:id="@+id/flashView"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="@color/white"
+        android:alpha="0" />
+
+    <!-- 顶栏 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top"
+        android:orientation="horizontal"
+        android:gravity="center_vertical"
+        android:paddingHorizontal="16dp"
+        android:paddingTop="44dp"
+        android:paddingBottom="8dp">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="@drawable/bg_chip"
+            android:paddingHorizontal="14dp"
+            android:paddingVertical="7dp"
+            android:text="@string/app_title"
+            android:textColor="@color/text_primary"
+            android:textSize="14sp"
+            android:textStyle="bold" />
+
+        <Space
+            android:layout_width="0dp"
+            android:layout_height="1dp"
+            android:layout_weight="1" />
+
+        <TextView
+            android:id="@+id/sceneChip"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:background="@drawable/bg_chip"
+            android:paddingHorizontal="14dp"
+            android:paddingVertical="7dp"
+            android:textColor="@color/brand_accent"
+            android:textSize="13sp"
+            android:visibility="gone" />
+
+        <ImageButton
+            android:id="@+id/btnSwitchCamera"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_marginStart="10dp"
+            android:background="@drawable/bg_chip"
+            android:contentDescription="切换镜头"
+            android:padding="8dp"
+            android:src="@drawable/ic_switch_camera" />
+    </LinearLayout>
+
+    <!-- 匹配度徽标 -->
+    <TextView
+        android:id="@+id/scoreBadge"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="top|end"
+        android:layout_marginTop="104dp"
+        android:layout_marginEnd="16dp"
+        android:background="@drawable/bg_chip"
+        android:paddingHorizontal="14dp"
+        android:paddingVertical="8dp"
+        android:textColor="@color/pose_match"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:visibility="gone" />
+
+    <!-- 姿势纠正提示 -->
+    <TextView
+        android:id="@+id/hintText"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom|center_horizontal"
+        android:layout_marginBottom="258dp"
+        android:background="@drawable/bg_chip"
+        android:paddingHorizontal="16dp"
+        android:paddingVertical="8dp"
+        android:textColor="@color/text_primary"
+        android:textSize="14sp"
+        android:visibility="gone" />
+
+    <!-- 底部面板：分类 + 姿势卡片 + 快门 -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:background="@drawable/bg_bottom_scrim"
+        android:orientation="vertical"
+        android:paddingTop="28dp">
+
+        <HorizontalScrollView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:scrollbars="none">
+
+            <com.google.android.material.chip.ChipGroup
+                android:id="@+id/categoryChips"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:paddingHorizontal="12dp"
+                android:singleLine="true" />
+        </HorizontalScrollView>
+
+        <androidx.recyclerview.widget.RecyclerView
+            android:id="@+id/poseStrip"
+            android:layout_width="match_parent"
+            android:layout_height="108dp"
+            android:layout_marginTop="10dp"
+            android:clipToPadding="false"
+            android:paddingHorizontal="12dp" />
+
+        <FrameLayout
+            android:layout_width="match_parent"
+            android:layout_height="104dp">
+
+            <ImageView
+                android:id="@+id/lastPhotoThumb"
+                android:layout_width="52dp"
+                android:layout_height="52dp"
+                android:layout_gravity="center_vertical"
+                android:layout_marginStart="28dp"
+                android:background="@drawable/bg_pose_card"
+                android:clipToOutline="true"
+                android:scaleType="centerCrop"
+                android:visibility="gone" />
+
+            <ImageView
+                android:id="@+id/btnShutter"
+                android:layout_width="76dp"
+                android:layout_height="76dp"
+                android:layout_gravity="center"
+                android:background="@drawable/bg_shutter"
+                android:contentDescription="拍照" />
+
+            <ImageButton
+                android:id="@+id/btnDetectScene"
+                android:layout_width="44dp"
+                android:layout_height="44dp"
+                android:layout_gravity="center_vertical|end"
+                android:layout_marginEnd="28dp"
+                android:background="@drawable/bg_chip"
+                android:contentDescription="@string/scene_detect"
+                android:padding="10dp"
+                android:src="@drawable/ic_scene" />
+        </FrameLayout>
+    </LinearLayout>
+</FrameLayout>

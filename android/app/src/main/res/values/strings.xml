@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">PoseAdvisor</string>
+    <string name="app_title">姿势顾问</string>
+    <string name="camera_permission_rationale">需要相机权限才能进行实时姿势推荐与拍照</string>
+    <string name="score_label">匹配度</string>
+    <string name="pose_detecting">正在识别您的姿势…</string>
+    <string name="pose_not_found">未检测到人体，请站入画面</string>
+    <string name="capture_saved">已保存</string>
+    <string name="hint_perfect">姿势很棒，可以拍了！</string>
+    <string name="scene_detect">场景识别</string>
+</resources>

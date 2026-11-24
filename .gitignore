@@ -1,3 +1,4 @@
+# ===== Python =====
 __pycache__/
 .cache/
 .idea/
@@ -8,10 +9,39 @@ __pycache__/
 .env
 venv/
 .env/
-*.obj
-*.npz
-*.png
-*.pt
-*.pth
 .DS_Store
 ._*
+
+# ===== 大型模型与受限资源（不上传 GitHub）=====
+*.obj
+*.pt
+*.pth
+model/
+vposer_v1_0/
+outputs/
+*.npz
+
+# ===== 临时条件图片（第三方随机图片，仅用于离线生成）=====
+tools/cond_images/
+demo/input/
+
+# ===== 敏感信息 =====
+token.txt
+
+# ===== Android 构建产物 =====
+.android-sdk/
+local.properties
+**/local.properties
+.gradle/
+**/build/
+.cxx/
+*.apk
+*.aab
+*.keystore
+keystore.properties
+dist/
+!gradle-wrapper.jar
+
+# ===== 缩略图 PNG 例外（App 资源需提交）=====
+*.png
+!android/app/src/main/assets/poses/*.png

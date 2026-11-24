@@ -367,29 +367,4 @@ def main():
 
 
 if __name__ == "__main__":
-    # # 使用示例
-    # # image_path = r"E:\大创\photo_structure\images\image_10.jpg"
-    # # output_dir = r"E:\大创\photo_structure\pose_outputs"
-    # # process_single_image(image_path, output_dir)
-    #
-    # # 或者使用命令行参数
-    # # python mediapipe_to_pose_vector.py --input "你的图片路径.jpg" --output_dir "输出目录"
-    #
-    # # 批量处理
-    # # python mediapipe_to_pose_vector.py --input "图片目录" --batch
-    #
-    # # 直接在这里设置参数运行
-    # image_path = r"E:\大创\photo_structure\images\image_10.jpg"
-    # output_dir = r"E:\大创\photo_structure\pose_outputs"
-    #
-    # print("开始处理单张图片...")
-    # result = process_single_image(image_path, output_dir)
-    #
-    # if result is not None:
-    #     pose_vector, joints_25 = result
-    #     print("\n处理成功！")
-    #     print(f"75维姿态向量形状: {pose_vector.shape}")
-    #     print(f"25个关节点形状: {joints_25.shape}")
-    # else:
-    #     print("处理失败")
-    pass
+    main()
